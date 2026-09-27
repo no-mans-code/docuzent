@@ -1,0 +1,11 @@
+```mermaid
+graph TD
+  A[Document Source] --> B[Ingestion & Extraction]
+  B --> C[Chunking]
+  C --> D[Hierarchy Builder]
+  D --> E[KV Cache Layer]
+  E --> F[Query Resolver]
+  F --> G[LLM (Ollama / GPT-4o)]
+  G --> H[Response]
+  E --> I[Metrics & Stats UI]
+```
