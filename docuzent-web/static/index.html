@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docuzent — learn a document quickly</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e37;
+    --text: #e6e8eb;
+    --muted: #8b90a0;
+    --accent: #5b8cff;
+    --accent-text: #0b0d10;
+    --error: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+  main {
+    width: 100%;
+    max-width: 720px;
+  }
+  h1 {
+    font-size: 1.4rem;
+    margin: 0 0 4px;
+  }
+  .subtitle {
+    color: var(--muted);
+    margin: 0 0 24px;
+    font-size: 0.95rem;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  input[type="file"] {
+    color: var(--text);
+    flex: 1;
+  }
+  input[type="text"] {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+  input[type="text"]:focus, input[type="file"]:focus {
+    outline: 2px solid var(--accent);
+  }
+  button {
+    background: var(--accent);
+    color: var(--accent-text);
+    border: none;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
+  .status {
+    margin-top: 12px;
+    font-size: 0.88rem;
+    color: var(--muted);
+    min-height: 1.2em;
+  }
+  .status.error { color: var(--error); }
+  .spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    margin-right: 6px;
+    vertical-align: -1px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #qaSection { display: none; }
+  .transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .turn {
+    border-left: 3px solid var(--accent);
+    padding-left: 12px;
+  }
+  .question {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-bottom: 4px;
+  }
+  .answer {
+    white-space: pre-wrap;
+    line-height: 1.45;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin-top: 6px;
+  }
+  footer {
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: center;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>docuzent</h1>
+  <p class="subtitle">Learn a document quickly — upload one file (or a .zip of them), then ask it anything.</p>
+
+  <section class="panel">
+    <div class="row">
+      <input type="file" id="fileInput" accept="*/*">
+      <button id="loadBtn">Load document</button>
+    </div>
+    <div class="status" id="loadStatus"></div>
+  </section>
+
+  <section class="panel" id="qaSection">
+    <div class="row">
+      <input type="text" id="questionInput" placeholder="Ask a question about this document…">
+      <button id="askBtn">Ask</button>
+    </div>
+    <div class="status" id="askStatus"></div>
+    <div class="transcript" id="transcript"></div>
+  </section>
+
+  <footer id="modelInfo"></footer>
+</main>
+
+<script>
+const loadBtn = document.getElementById('loadBtn');
+const fileInput = document.getElementById('fileInput');
+const loadStatus = document.getElementById('loadStatus');
+const qaSection = document.getElementById('qaSection');
+const questionInput = document.getElementById('questionInput');
+const askBtn = document.getElementById('askBtn');
+const askStatus = document.getElementById('askStatus');
+const transcript = document.getElementById('transcript');
+const modelInfo = document.getElementById('modelInfo');
+
+function setStatus(el, text, isError) {
+  el.textContent = text;
+  el.classList.toggle('error', !!isError);
+}
+
+async function loadDocument() {
+  const file = fileInput.files[0];
+  if (!file) {
+    setStatus(loadStatus, 'Choose a file first.', true);
+    return;
+  }
+  loadBtn.disabled = true;
+  setStatus(loadStatus, '', false);
+  loadStatus.innerHTML = '<span class="spinner"></span>Parsing via Docling — this can take a while for large PDFs…';
+
+  const form = new FormData();
+  form.append('file', file, file.name);
+
+  try {
+    const resp = await fetch('/load', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(loadStatus, data.error || 'Failed to load document.', true);
+      return;
+    }
+    setStatus(
+      loadStatus,
+      `Loaded ${data.chars.toLocaleString()} chars — ${data.fits_in_one_chunk ? 'fits in one chunk' : 'will use map-reduce'} — ${data.warm_from_disk ? 'warm from disk cache' : 'cold, not seen before'}`,
+      false
+    );
+    qaSection.style.display = 'block';
+    transcript.innerHTML = '';
+    questionInput.focus();
+  } catch (e) {
+    setStatus(loadStatus, 'Request failed: ' + e, true);
+  } finally {
+    loadBtn.disabled = false;
+  }
+}
+
+async function askQuestion() {
+  const question = questionInput.value.trim();
+  if (!question) return;
+  askBtn.disabled = true;
+  questionInput.disabled = true;
+  setStatus(askStatus, '', false);
+  askStatus.innerHTML = '<span class="spinner"></span>Thinking…';
+
+  try {
+    const resp = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(askStatus, data.error || 'Failed to answer.', true);
+      return;
+    }
+    setStatus(askStatus, '', false);
+    const turn = document.createElement('div');
+    turn.className = 'turn';
+    const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(', ');
+    const modeBit = data.used_map_reduce ? `map-reduce over ${data.chunks_mapped} chunks` : 'single chunk';
+    turn.innerHTML = `
+      <div class="question">${escapeHtml(question)}</div>
+      <div class="answer">${escapeHtml(data.answer)}</div>
+      <div class="meta">${modeBit} — ${metaBits}</div>
+    `;
+    transcript.prepend(turn);
+    questionInput.value = '';
+  } catch (e) {
+    setStatus(askStatus, 'Request failed: ' + e, true);
+  } finally {
+    askBtn.disabled = false;
+    questionInput.disabled = false;
+    questionInput.focus();
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+loadBtn.addEventListener('click', loadDocument);
+askBtn.addEventListener('click', askQuestion);
+questionInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') askQuestion(); });
+
+fetch('/model-info').then(r => r.json()).then(d => {
+  modelInfo.textContent = `model: ${d.model} · context window: ${d.context_length.toLocaleString()} tokens · cache: ${d.cache_path}`;
+}).catch(() => {});
+</script>
+</body>
+</html>

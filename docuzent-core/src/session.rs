@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use kvcache::Cache;
+use serde::Serialize;
 
 use crate::archive;
 use crate::chunk::{self, DEFAULT_MAX_CHARS};
@@ -51,7 +52,7 @@ pub struct Session<G: Generator> {
     current: Option<CurrentDoc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LoadReport {
     pub chars: usize,
     pub fits_in_one_chunk: bool,
@@ -60,7 +61,7 @@ pub struct LoadReport {
     pub warm_from_disk: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AnswerReport {
     pub answer: String,
     pub used_map_reduce: bool,
@@ -68,7 +69,7 @@ pub struct AnswerReport {
     pub timings: Vec<CallTiming>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CallTiming {
     pub label: String,
     pub prompt_eval_count: u64,
