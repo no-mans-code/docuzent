@@ -1,0 +1,14 @@
+[package]
+name = "docuzent-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "docuzent"
+path = "src/main.rs"
+
+[dependencies]
+docuzent-core = { path = "../docuzent-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+kvcache = { git = "https://github.com/no-mans-code/kvcache" }
