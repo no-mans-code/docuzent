@@ -1,1 +1,9 @@
 __pycache__/
+.venv/
+target/
+temp-test-out/
+.docuzent-cache/
+*.redb
+
+# Personal test fixtures (copyrighted textbook scans) - local only, never committed
+/temp-test/
