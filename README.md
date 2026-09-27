@@ -23,6 +23,10 @@ cargo build --release
 
 # Benchmark the on-disk context cache's real effect on one document
 ./target/release/docuzent bench ./report.pdf --model qwen2.5:3b
+
+# Or use the browser UI instead of the CLI
+cargo run -p docuzent-web -- --model qwen2.5:3b --port 3800
+# then open http://localhost:3800 - upload a document, ask it questions
 ```
 
 Requires a running local Ollama (`ollama serve`) with the chosen model pulled, and Docling set up per [Docling Setup](#docling-setup) below. The folder-watching, multi-document RAG mode described further down is on hold; `ask`/`bench` (single-document mode) are what's built and verified today.

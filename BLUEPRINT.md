@@ -94,6 +94,8 @@ The full folder-watching RAG system above is on hold while this simpler, paralle
 
 **Benchmark**: `docuzent bench <file>` runs a genuinely cold session (fresh cache file) then a fresh session reusing what the cold run persisted, and reports both runs' real `prompt_eval_duration` plus the measured speedup - not a claimed number, a computed one from that specific document and model.
 
+**Web UI** (`docuzent-web`) - a minimal axum server (loopback-only, no Node) exposing the same `Session` over HTTP: `GET /` serves a single static page (plain HTML/CSS/vanilla JS, no build step), `POST /load` (multipart file upload) calls `load_document`, `POST /ask` (JSON) calls `ask`, `GET /model-info` reports the active model/context/cache path. State is one `Session` behind a `Mutex`, wrapped in `tokio::task::spawn_blocking` since Docling/Ollama calls are synchronous - this is a single-user local tool, not a multi-tenant server. Verified for real over HTTP: upload a document (multipart), ask a question, ask a follow-up in the same session (context reused, no re-prime) - all against live Docling + live Ollama. Run with `cargo run -p docuzent-web -- --model qwen2.5:3b --port 3800`, then open the printed URL.
+
 ## Assumptions & Constraints
 
 - **Disk Space** – KV cache is capped at 100 GB; any additional data is pruned using LRU.
@@ -113,4 +115,4 @@ The full folder-watching RAG system above is on hold while this simpler, paralle
 * [ ] Context-budget check routing between full-context and retrieval mode (RAG mode).
 * [ ] Query/answer cache keyed on `(query, corpus version)` (RAG mode).
 * [ ] Folder watcher (`notify` crate) wired to re-ingest on change (RAG mode).
-* [ ] Web UI (`docuzent-web`: axum + askama + SSE) - would serve both modes.
+* [x] Web UI for simple mode (`docuzent-web`: axum, static HTML/vanilla JS, no Node) - load a document, ask questions, verified for real over HTTP. A RAG-mode UI, if that product resumes, would be separate.
