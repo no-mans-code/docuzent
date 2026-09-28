@@ -45,7 +45,7 @@ fn context_persists_to_disk_across_a_fresh_session() {
     let cache1 = Cache::open(&db_path.0, 1_000_000_000).unwrap();
     let docling_cache1 = DoclingCache::open(&docling_path.0, 1_000_000_000).unwrap();
     let mut session1 =
-        Session::open(OllamaClient::new(HOST, MODEL, context_length), MODEL, context_length, work_dir.clone(), Mode::Swap, cache1, docling_cache1).unwrap();
+        Session::open(OllamaClient::new(HOST, MODEL, context_length), MODEL, context_length, work_dir.clone(), Mode::Swap, docuzent_core::session::DEFAULT_MAP_REDUCE_CONTEXT_FRACTION, cache1, docling_cache1).unwrap();
 
     let doc_path = PathBuf::from("../temp-test/jess1a1 (4).pdf");
     let load1 = session1.load_document(&doc_path).unwrap();
@@ -62,7 +62,7 @@ fn context_persists_to_disk_across_a_fresh_session() {
     let cache2 = Cache::open(&db_path.0, 1_000_000_000).unwrap();
     let docling_cache2 = DoclingCache::open(&docling_path.0, 1_000_000_000).unwrap();
     let mut session2 =
-        Session::open(OllamaClient::new(HOST, MODEL, context_length), MODEL, context_length, work_dir.clone(), Mode::Swap, cache2, docling_cache2).unwrap();
+        Session::open(OllamaClient::new(HOST, MODEL, context_length), MODEL, context_length, work_dir.clone(), Mode::Swap, docuzent_core::session::DEFAULT_MAP_REDUCE_CONTEXT_FRACTION, cache2, docling_cache2).unwrap();
     let load2 = session2.load_document(&doc_path).unwrap();
     assert!(load2.warm_from_disk, "the same document, model, and context length should hit the disk cache");
 
