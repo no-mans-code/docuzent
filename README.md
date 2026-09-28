@@ -209,6 +209,16 @@ This is attribution over the existing map-reduce output, not new retrieval - it 
 
 ---
 
+## Prefix-aware cache reuse for lightly-edited/growing documents
+
+Before this, the disk-context cache was keyed by the hash of a document's *entire* text - appending one line to a growing log, or fixing a typo at the end of a draft, was a 100% cache miss, paying a full cold re-prime of the whole document every time. `Session` now recognizes this real, common case: when a newly-loaded document shares a long common prefix with whatever was primed last for the same `(model, context_length)` - at least 2,000 characters and at least half of the previous document's length - it primes only the *new suffix* against the previous document's cached context (the same context-extension mechanism already used for follow-up questions), instead of re-priming everything from scratch.
+
+Deliberately narrow, matching the real case it targets: a genuine append-only relationship (the new text starts with the old one), not general-purpose diffing - an edit anywhere but the end shifts every byte after it and won't match, by design. Shows up as a `"prefix-reprime"` timing label, distinct from a normal cold `"prime"`.
+
+Real, verified: a 34,704-character real text file, asked about, then grown by one appended sentence and asked about again - the second call's prompt-eval dropped from the first call's cold-prime cost to `prefix-reprime: 21ms` for the ~14,000-token context, priming only the new sentence rather than the whole document again. Raw mode never attempts this (it never touches the disk cache at all, by design). See [issue #37](https://github.com/no-mans-code/docuzent/issues/37).
+
+---
+
 ## Docling Setup
 
 Docling (the ingestion engine) is a Python package with no native Rust bindings, so `docuzent` shells out to its CLI. Set up a local venv once:

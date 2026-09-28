@@ -73,6 +73,22 @@ pub const DEFAULT_MAP_REDUCE_CONTEXT_FRACTION: f32 = 0.25;
 /// One-time real disk-bandwidth measurement size, matching
 /// `ollama-kv-profiler`'s own usage.
 const DISK_BENCH_BYTES: usize = 256 * 1024 * 1024;
+/// Minimum shared leading characters before prefix reuse is attempted -
+/// below this, the saved prefill isn't worth the risk of a spurious match.
+const MIN_PREFIX_REUSE_CHARS: usize = 2000;
+/// The shared prefix must cover at least this much of the previous
+/// document - less means it was rewritten, not appended to.
+const MIN_PREFIX_REUSE_FRACTION: f32 = 0.5;
+
+#[derive(Serialize, serde::Deserialize)]
+struct LastDocRecord {
+    doc_hash: String,
+    text: String,
+}
+
+fn common_prefix_char_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
 
 /// How `Session` decides whether to reuse the LLM-context cache. See the
 /// module doc comment for what each variant actually does.
@@ -246,6 +262,74 @@ impl<G: Generator> Session<G> {
 
     fn cache_key(&self, doc_hash: &str) -> String {
         format!("{}|{}|{doc_hash}", self.model, self.context_length)
+    }
+
+    fn lastdoc_cache_key(&self) -> String {
+        format!("lastdoc|{}|{}", self.model, self.context_length)
+    }
+
+    /// Records `text` as the most recently primed document for this
+    /// `(model, context_length)` - compared against on a future *different*
+    /// document's load to see whether it's really just this one grown or
+    /// lightly edited (see [`Self::try_prefix_reuse`]). Stores the real
+    /// document text alongside the existing context cache (same
+    /// `kvcache::Cache`, a different key prefix), since a future
+    /// comparison needs the actual previous content, not just its opaque
+    /// Ollama context tokens. Only ever one entry per `(model,
+    /// context_length)` - overwritten each time, not one per document
+    /// ever seen, so this doesn't grow with corpus history.
+    fn save_lastdoc(&self, doc_hash: &str, text: &str) -> Result<()> {
+        let record = LastDocRecord { doc_hash: doc_hash.to_string(), text: text.to_string() };
+        self.disk_cache.put(&self.lastdoc_cache_key(), &serde_json::to_vec(&record)?)?;
+        Ok(())
+    }
+
+    /// Tries to avoid a full cold re-prime for a document that's really
+    /// just a lightly-edited or grown version of whatever was primed
+    /// last for this `(model, context_length)` - a common real case
+    /// (an append-only log, a work-in-progress draft or source file)
+    /// where today's whole-document-hash cache key gives a 100% miss on
+    /// any change at all, however small. See
+    /// https://github.com/no-mans-code/docuzent/issues/37.
+    ///
+    /// Deliberately narrow: only handles a genuine *prefix* match (the
+    /// new text starts with a long, real majority of the previous text) -
+    /// an edit anywhere but the end shifts every byte after it and won't
+    /// match here, by design (see the issue's explicit scope note; a
+    /// chunk-level diff to handle that is a separate, harder problem).
+    /// Returns `Ok(None)` whenever reuse isn't applicable or safe to try -
+    /// never an error for "no reuse available," only for a real I/O/
+    /// generation failure.
+    fn try_prefix_reuse(&mut self, doc_hash: &str, text: &str, timings: &mut Vec<CallTiming>) -> Result<Option<Vec<i64>>> {
+        let Some(bytes) = self.disk_cache.get(&self.lastdoc_cache_key())? else { return Ok(None) };
+        let last: LastDocRecord = serde_json::from_slice(&bytes)?;
+        if last.doc_hash == doc_hash {
+            return Ok(None); // identical document - the normal disk_context path already covers this
+        }
+
+        let common_prefix_chars = common_prefix_char_len(&last.text, text);
+        let last_len = last.text.chars().count();
+        if common_prefix_chars < MIN_PREFIX_REUSE_CHARS || last_len == 0 || (common_prefix_chars as f32) < last_len as f32 * MIN_PREFIX_REUSE_FRACTION {
+            return Ok(None); // not a real append-only relationship - likely an unrelated or heavily-rewritten document
+        }
+
+        // The previous document's own cached context must still be on
+        // disk to resume from - it may have been evicted since, in which
+        // case there's nothing to extend and a normal cold prime is the
+        // only option.
+        let Some(old_context_bytes) = self.disk_cache.get(&self.cache_key(&last.doc_hash))? else { return Ok(None) };
+        let old_context: Vec<i64> = serde_json::from_slice(&old_context_bytes)?;
+
+        let suffix: String = text.chars().skip(common_prefix_chars).collect();
+        if suffix.is_empty() {
+            return Ok(None); // nothing new to prime - shouldn't happen given doc_hash differs, but never prime on empty text
+        }
+
+        let prime_prompt = format!("More of the same document follows. Read it, then wait for the question.\n\n{suffix}");
+        let (resp, timing) = timed(&self.generator, &prime_prompt, Some(&old_context), "prefix-reprime")?;
+        self.record_ingest_from_response(&resp, &timing);
+        timings.push(timing);
+        Ok(Some(resp.context))
     }
 
     /// The real, measured tokens/sec this session's `(model, context_length)`
@@ -596,11 +680,29 @@ impl<G: Generator> Session<G> {
                 Some(c) => c,
                 None => {
                     let disk_context = if self.mode == Mode::Raw { None } else { current.disk_context.clone() };
-                    let prime_prompt = format!(
-                        "You will be asked questions about the following document. Read it, then wait for the question.\n\n{text}"
-                    );
-                    let (ctx, decision) = self.resolve_context(&text, &doc_hash, &prime_prompt, "prime", question, disk_context, &mut timings)?;
-                    adaptive_decision = decision;
+                    // Only worth trying when this exact document has
+                    // never been seen before (a `disk_context` hit means
+                    // it has, and the normal swap/adaptive path below
+                    // already handles that) - see issue #37.
+                    let prefix_reused =
+                        if self.mode != Mode::Raw && disk_context.is_none() { self.try_prefix_reuse(&doc_hash, &text, &mut timings)? } else { None };
+                    let ctx = match prefix_reused {
+                        Some(reused_ctx) => {
+                            self.disk_cache.put(&self.cache_key(&doc_hash), &serde_json::to_vec(&reused_ctx)?)?;
+                            reused_ctx
+                        }
+                        None => {
+                            let prime_prompt = format!(
+                                "You will be asked questions about the following document. Read it, then wait for the question.\n\n{text}"
+                            );
+                            let (ctx, decision) = self.resolve_context(&text, &doc_hash, &prime_prompt, "prime", question, disk_context, &mut timings)?;
+                            adaptive_decision = decision;
+                            ctx
+                        }
+                    };
+                    if self.mode != Mode::Raw {
+                        self.save_lastdoc(&doc_hash, &text)?;
+                    }
                     if let Some(c) = self.current.as_mut() {
                         c.active_context = Some(ctx.clone());
                     }
@@ -973,6 +1075,116 @@ mod tests {
         let report = session.ask("what is this about?").unwrap();
         assert!(report.used_map_reduce);
         assert!(report.sources.is_empty(), "no chunk extracted anything real in this test - sources must reflect that honestly");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    // Regression tests for issue #37 (prefix-aware cache reuse for
+    // lightly-edited/growing documents) - model-free.
+
+    #[test]
+    fn a_grown_document_reuses_the_previous_ones_context_via_prefix_reprime() {
+        let base_text = unique_big_text(2000); // well over MIN_PREFIX_REUSE_CHARS
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &base_text, 100_000, Mode::Swap);
+        session.current.as_mut().unwrap().doc_hash = "doc-a".to_string();
+        let report_a = session.ask("about doc a").unwrap();
+        assert_eq!(report_a.timings[0].label, "prime", "first-ever document must still cold-prime normally");
+
+        // Simulate loading an append-only-edited version: same content,
+        // plus more at the end - a real, common case (a growing log, a
+        // draft, a work-in-progress source file).
+        let extended_text = format!("{base_text}some brand new content appended at the end of the document");
+        session.current = Some(CurrentDoc {
+            doc_hash: "doc-b".to_string(),
+            text: extended_text,
+            source_files: vec!["draft.txt".to_string()],
+            disk_context: None, // doc-b (this exact hash) has never been seen before
+            active_context: None,
+        });
+
+        let report_b = session.ask("about doc b").unwrap();
+        assert_eq!(report_b.timings[0].label, "prefix-reprime", "should reuse doc A's context and prime only the new suffix, not cold-reprime the whole document");
+
+        // doc-b's own context is now cached too, for its own future reuse.
+        assert!(session.disk_cache.get(&session.cache_key("doc-b")).unwrap().is_some());
+
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn an_unrelated_document_does_not_trigger_prefix_reuse() {
+        let base_text = unique_big_text(2000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &base_text, 100_000, Mode::Swap);
+        session.current.as_mut().unwrap().doc_hash = "doc-a".to_string();
+        session.ask("about doc a").unwrap();
+
+        // Genuinely unrelated content - no shared prefix at all.
+        let unrelated_text = "completely different content with no relation whatsoever ".repeat(100);
+        session.current = Some(CurrentDoc {
+            doc_hash: "doc-c".to_string(),
+            text: unrelated_text,
+            source_files: vec!["other.txt".to_string()],
+            disk_context: None,
+            active_context: None,
+        });
+
+        let report_c = session.ask("about doc c").unwrap();
+        assert_eq!(report_c.timings[0].label, "prime", "an unrelated document must cold-prime normally, not be mistaken for a prefix extension");
+
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn a_too_short_shared_prefix_does_not_trigger_reuse() {
+        let base_text = unique_big_text(2000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &base_text, 100_000, Mode::Swap);
+        session.current.as_mut().unwrap().doc_hash = "doc-a".to_string();
+        session.ask("about doc a").unwrap();
+
+        // Shares only the first ~30 characters, then diverges entirely -
+        // below MIN_PREFIX_REUSE_CHARS, so this isn't a real append-only
+        // relationship even though it technically has *a* common prefix.
+        let short_shared_prefix: String = base_text.chars().take(30).collect();
+        let barely_related_text = format!("{short_shared_prefix}{}", "totally different rest of the document ".repeat(100));
+        session.current = Some(CurrentDoc {
+            doc_hash: "doc-d".to_string(),
+            text: barely_related_text,
+            source_files: vec!["other2.txt".to_string()],
+            disk_context: None,
+            active_context: None,
+        });
+
+        let report_d = session.ask("about doc d").unwrap();
+        assert_eq!(report_d.timings[0].label, "prime", "a trivially short shared prefix must not trigger reuse");
+
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn raw_mode_never_attempts_prefix_reuse() {
+        let base_text = unique_big_text(2000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &base_text, 100_000, Mode::Raw);
+        session.current.as_mut().unwrap().doc_hash = "doc-a".to_string();
+        session.ask("about doc a").unwrap();
+        // Raw mode never writes to disk_cache at all, so there is no
+        // lastdoc record and nothing to reuse - the extended document
+        // must cold-prime, matching raw mode's "no reuse, ever" contract.
+        assert_eq!(session.disk_cache.get(&session.lastdoc_cache_key()).unwrap(), None);
+
+        let extended_text = format!("{base_text}more content appended");
+        session.current = Some(CurrentDoc {
+            doc_hash: "doc-b".to_string(),
+            text: extended_text,
+            source_files: vec!["draft.txt".to_string()],
+            disk_context: None,
+            active_context: None,
+        });
+        let report_b = session.ask("about doc b").unwrap();
+        assert_eq!(report_b.timings[0].label, "prime");
+
         std::fs::remove_file(&cache_path).ok();
         std::fs::remove_file(&docling_path).ok();
     }
