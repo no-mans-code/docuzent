@@ -21,12 +21,23 @@ pub trait Generator {
 pub struct OllamaClient {
     host: String,
     model: String,
+    /// Passed as `options.num_ctx` on every request - without this, Ollama
+    /// silently runs at its own 4096-token default regardless of what
+    /// context length the caller inferred and sized chunking decisions
+    /// around, truncating anything longer without any error (the real bug
+    /// this field exists to fix).
+    num_ctx: u32,
 }
 
 impl OllamaClient {
-    pub fn new(host: impl Into<String>, model: impl Into<String>) -> Self {
-        Self { host: host.into(), model: model.into() }
+    pub fn new(host: impl Into<String>, model: impl Into<String>, num_ctx: u32) -> Self {
+        Self { host: host.into(), model: model.into(), num_ctx }
     }
+}
+
+#[derive(Serialize)]
+struct GenerateOptions {
+    num_ctx: u32,
 }
 
 #[derive(Serialize)]
@@ -36,6 +47,7 @@ struct GenerateRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<&'a [i64]>,
+    options: GenerateOptions,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -61,7 +73,7 @@ pub struct GenerateResponse {
 impl Generator for OllamaClient {
     fn generate(&self, prompt: &str, context: Option<&[i64]>) -> Result<GenerateResponse> {
         let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
-        let req = GenerateRequest { model: &self.model, prompt, stream: false, context };
+        let req = GenerateRequest { model: &self.model, prompt, stream: false, context, options: GenerateOptions { num_ctx: self.num_ctx } };
         let resp: GenerateResponse = ureq::post(&url)
             .send_json(req)
             .with_context(|| format!("ollama generate request to {url} failed - is `ollama serve` running?"))?
