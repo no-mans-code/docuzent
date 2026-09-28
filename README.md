@@ -92,6 +92,34 @@ Each `AskResponse`/CLI answer reports the real decision made (`adaptive_decision
 
 ---
 
+## Map-reduce: per-chunk caching, and a real context-size finding
+
+Map-reduce (the path for a document too big for one context window - see `chunks_mapped`/`used_map_reduce` in `AnswerReport`) now honors `Mode` per chunk, not just for the whole document: each chunk gets its own disk-cache entry keyed by its own content hash, checked/predicted through the same swap/raw/adaptive logic as the single-chunk path. Only the chunk's *primed* state is ever persisted - never a state that reflects a specific question's answer, so a second, completely different question about the same large document reuses every chunk's cached context rather than re-processing the document cold again. Confirmed with a real run: asking a second, unrelated question about the same 10-file, 200K-character real document showed 6 of 7 chunks reused from disk with zero re-priming, only the one chunk whose boundary shifted needed a fresh prime.
+
+`--map-reduce-context-fraction` (default `0.25`) controls how much of a model's *nominal* context window a single chunk is sized to use - deliberately not the model's full window. This exists because of a real, confirmed failure, not a theoretical concern: `devstral-small-2:24b` reports a nominal context of 393,216 tokens, but its own metadata (`mistral3.rope.scaling.original_context_length`) shows it was actually trained on 8,192 tokens - the rest is RoPE-scaling extrapolation. Trusting the nominal number sized a single chunk to the model's *entire* 393K window, which fit an entire real 200K-character document into one prime call - and that call failed outright (Ollama became unreachable and the model was no longer resident afterward), not just "produced a worse answer." Overriding `--context-length` to the model's real trained size (8192) restored normal map-reduce behavior immediately.
+
+### A real, and counter-intuitive, chunk-size-vs-accuracy result
+
+Tested a genuinely compound question ("What energy resources are described, how are they connected to the manufacturing industries discussed, and what role does the transport network play in connecting them?") against the same real 10-file NCERT document, varying only `--map-reduce-context-fraction`:
+
+| Model | Fraction | Chunks | Answer quality (real output) |
+|---|---|---|---|
+| `qwen3:0.6b` | 0.25 (narrow) | 5 | Vague, generic, ends with a confusing stray "NONE" - "energy resources such as minerals and energy sources related to manufacturing... All relevant points are addressed. **Answer**: NONE." |
+| `qwen3:0.6b` | 0.75 (wide) | 2 | Specific, coherent, correct - "coal, iron ore, and cement... railways, pipelines, highways... steel, cement, aluminum... critical for... economic growth and regional integration." |
+| `qwen2.5:3b` | 0.25 (narrow) | 7 | A false negative - "does not contain information about energy resources... does not mention... ties to manufacturing industries" (the document does cover this; the model just couldn't see it from fragmented chunks) |
+
+The starting hypothesis going into this (`max_context // 4`, narrower is safer) was **wrong for this question shape**. Narrower chunks fragmented the document across more, smaller pieces - for a compound question spanning three related concepts, a single chunk was less likely to contain enough of the connective material to answer well, regardless of model size (the same narrow-fraction failure mode showed up in both the 0.6B *and* 3B models). Wider chunks let even the smallest model tested see enough surrounding context to synthesize a correct, coherent answer.
+
+**Honest scope of this finding**: one real question, one real document, two model sizes fully compared (a third, 24B, was attempted but proved impractically slow on this hardware even at a realistic context size - see below) - a real, directionally useful signal, not a statistically validated default. The likely explanation (compound/multi-concept questions need chunks that can hold multiple related concepts together; narrow, single-concept-sized chunks may be fine or even better for narrow fact-lookup questions) is itself untested and worth checking before changing the shipped default. Tracked for further, broader validation in [issue #24](https://github.com/no-mans-code/docuzent/issues/24).
+
+**A separate, real finding about model size and hardware**: `devstral-small-2:24b`, even at its realistic 8192-token context, took long enough on this hardware (a 16GB GPU, meaning a 24B model spills significantly into system RAM) that a single real map-reduce question became impractical for interactive use - real evidence that "bigger model" isn't a free win for local, latency-sensitive use without matching hardware, independent of the context-size question above.
+
+### A real bug this same testing surfaced: reasoning models can return an empty answer
+
+`qwen3:0.6b` is a "thinking"-capable model - Ollama reports its internal reasoning in a separate `thinking` field, distinct from `response` (the visible answer). Every call is capped at a fixed generation budget (`num_predict`, 1536 tokens) so a broad question can't run unbounded - but a real compound question showed the model could spend its *entire* budget reasoning and never reach a visible answer at all: `response` came back empty while `thinking` held a real, if incomplete, trace. `GenerateResponse::text()` now falls back to a labeled excerpt of `thinking` when `response` is empty but the model produced something - never a silently blank answer when the model genuinely said something.
+
+---
+
 ## Docling Setup
 
 Docling (the ingestion engine) is a Python package with no native Rust bindings, so `docuzent` shells out to its CLI. Set up a local venv once:
