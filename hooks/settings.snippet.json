@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${ASSISTANT_PROJECT_DIR}/.assistant/hooks/docuzent-block-large-reads.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

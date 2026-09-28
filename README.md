@@ -166,6 +166,20 @@ assistant mcp add --transport stdio docuzent -- docker run -i --rm -v docuzent-m
 
 `host.docker.internal` (Docker Desktop's DNS name for the host machine) is the default `DOCUZENT_HOST`, matching the main `Dockerfile`'s convention - override with `-e DOCUZENT_HOST=...` on Linux Docker. Verified for real: built the image, ran it against a mounted file and the host's real Ollama, got a correct answer with `chars_loaded` matching the raw file exactly. See [issue #31](https://github.com/no-mans-code/docuzent/issues/31).
 
+### Auto-enforcing hook: don't rely on the agent remembering `ask_document`
+
+`ask_document`'s token savings only happen if the calling agent chooses to call it instead of reading a file directly - which it has no particular reason to prefer unless told to, every session. Inspired by [`token_save_mcp`](https://github.com/Habartru/token_save_mcp)'s `PreToolUse` hook, `hooks/docuzent-block-large-reads.sh` in this repo is a template coding agent hook: it intercepts a `Read` call on a file over a size threshold (`DOCUZENT_HOOK_SIZE_THRESHOLD_BYTES`, default 8000 bytes) and denies it with a message pointing the agent at `ask_document` instead - a real `PreToolUse` `permissionDecision: "deny"`, not just a suggestion in a system prompt.
+
+To use it in your own project:
+
+```bash
+mkdir -p .assistant/hooks
+cp /path/to/docuzent/hooks/docuzent-block-large-reads.sh .assistant/hooks/
+chmod +x .assistant/hooks/docuzent-block-large-reads.sh
+```
+
+Then merge `hooks/settings.snippet.json` into your project's `.assistant/settings.json`. Requires `jq`. Verified for real: a small file passes through silently; a 20KB file is denied with a message naming the real file path and byte count; malformed hook input and a non-`Read` tool call both fall through to "do nothing" rather than erroring. See [issue #36](https://github.com/no-mans-code/docuzent/issues/36).
+
 ---
 
 ## VRAM-aware context sizing (`docuzent_core::vram`)
