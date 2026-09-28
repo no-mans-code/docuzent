@@ -12,3 +12,4 @@ ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 kvcache = { git = "https://github.com/no-mans-code/kvcache" }
+ollama-kv-profiler = { git = "https://github.com/no-mans-code/ollama-kv-profiler" }

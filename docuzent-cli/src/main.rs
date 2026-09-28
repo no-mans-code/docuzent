@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
 use docuzent_core::ingest::{self, IngestOptions};
-use docuzent_core::session::{infer_context_length, Session};
+use docuzent_core::session::{infer_context_length, Mode, Session};
 use kvcache::Cache;
 
 /// docuzent - local document-intelligence CLI
@@ -40,28 +41,46 @@ enum Command {
         #[arg(long)]
         no_gpu: bool,
     },
-    /// Ask one or more questions about a single document (any format
-    /// Docling parses, or a .zip of them, extracted one level deep). The
-    /// model's context window is inferred automatically; a document that
-    /// fits is answered in one call, a bigger one via map-reduce.
+    /// Ask one or more questions about one or more documents, loaded
+    /// together as a single combined corpus (any format Docling parses,
+    /// or .zips of them, extracted one level deep). The model's context
+    /// window is inferred automatically unless overridden; a combined
+    /// corpus that fits is answered in one call, a bigger one via
+    /// map-reduce.
     Ask {
-        /// The document to load (or a .zip containing documents)
-        file: PathBuf,
+        /// The document(s) to load (or .zips containing documents) -
+        /// multiple files are combined into one corpus
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
         /// Ollama model to use
         #[arg(long, default_value = "qwen2.5:3b")]
         model: String,
         /// Ollama host
         #[arg(long, default_value = "http://localhost:11434")]
         host: String,
-        /// Where the on-disk context cache lives
+        /// How the LLM-context cache is used: swap (always reuse when
+        /// available), raw (never reuse - always a full cold reprocess),
+        /// adaptive (predict which is faster and pick per-request)
+        #[arg(long, default_value = "adaptive")]
+        mode: String,
+        /// Override the model's inferred context window (tokens).
+        /// Defaults to the model's real max, read from Ollama.
+        #[arg(long)]
+        context_length: Option<u32>,
+        /// Where the on-disk LLM-context cache lives
         #[arg(long, default_value = ".docuzent-cache/context.redb")]
         cache: PathBuf,
+        /// Where the on-disk Docling parse cache lives
+        #[arg(long, default_value = ".docuzent-cache/docling.redb")]
+        docling_cache: PathBuf,
         /// Ask exactly this one question and exit, instead of an interactive loop
         #[arg(long)]
         question: Option<String>,
     },
-    /// Benchmarks the on-disk context cache's real effect: a cold session
-    /// (no cache) vs. a fresh session reusing what the cold one persisted.
+    /// Benchmarks the on-disk LLM-context cache's real effect: a cold
+    /// session (no cache) vs. a fresh session reusing what the cold one
+    /// persisted. Always uses Mode::Swap - it exists to measure the cache
+    /// mechanism itself, not to compare modes.
     Bench {
         /// The document to benchmark against
         file: PathBuf,
@@ -79,7 +98,9 @@ fn main() -> Result<()> {
         Command::Ingest { source, output, to, docling_bin, device, no_gpu } => {
             run_ingest(source, output, to, docling_bin, device, no_gpu)
         }
-        Command::Ask { file, model, host, cache, question } => run_ask(file, model, host, cache, question),
+        Command::Ask { files, model, host, mode, context_length, cache, docling_cache, question } => {
+            run_ask(files, model, host, mode, context_length, cache, docling_cache, question)
+        }
         Command::Bench { file, model, host, question } => run_bench(file, model, host, question),
     }
 }
@@ -112,9 +133,19 @@ fn run_ingest(
     Ok(())
 }
 
-fn open_session(model: &str, host: &str, cache_path: &PathBuf) -> Result<Session<OllamaClient>> {
-    let context_length = infer_context_length(host, model)
-        .with_context(|| format!("failed to infer context size for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?;
+fn open_session(
+    model: &str,
+    host: &str,
+    mode: Mode,
+    context_length_override: Option<u32>,
+    cache_path: &PathBuf,
+    docling_cache_path: &PathBuf,
+) -> Result<Session<OllamaClient>> {
+    let context_length = match context_length_override {
+        Some(n) => n,
+        None => infer_context_length(host, model)
+            .with_context(|| format!("failed to infer context size for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?,
+    };
     println!("Model `{model}` context window: {context_length} tokens");
 
     if let Some(parent) = cache_path.parent() {
@@ -124,19 +155,48 @@ fn open_session(model: &str, host: &str, cache_path: &PathBuf) -> Result<Session
     println!("Context cache: {} (capacity {:.1} GB)", cache_path.display(), capacity as f64 / 1e9);
     let cache = Cache::open(cache_path, capacity)?;
 
-    Ok(Session::open(OllamaClient::new(host, model), model, context_length, std::env::temp_dir().join("docuzent-ask"), cache))
+    if let Some(parent) = docling_cache_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    println!(
+        "Docling parse cache: {} (capacity {:.1} GB)",
+        docling_cache_path.display(),
+        docuzent_core::docling_cache::DEFAULT_CAPACITY_BYTES as f64 / 1e9
+    );
+    let docling_cache = DoclingCache::open(docling_cache_path, docuzent_core::docling_cache::DEFAULT_CAPACITY_BYTES)?;
+
+    Session::open(
+        OllamaClient::new(host, model, context_length),
+        model,
+        context_length,
+        std::env::temp_dir().join("docuzent-ask"),
+        mode,
+        cache,
+        docling_cache,
+    )
 }
 
-fn run_ask(file: PathBuf, model: String, host: String, cache: PathBuf, question: Option<String>) -> Result<()> {
-    let mut session = open_session(&model, &host, &cache)?;
+#[allow(clippy::too_many_arguments)]
+fn run_ask(
+    files: Vec<PathBuf>,
+    model: String,
+    host: String,
+    mode: String,
+    context_length: Option<u32>,
+    cache: PathBuf,
+    docling_cache: PathBuf,
+    question: Option<String>,
+) -> Result<()> {
+    let mode = Mode::parse(&mode)?;
+    let mut session = open_session(&model, &host, mode, context_length, &cache, &docling_cache)?;
 
-    let load = session.load_document(&file)?;
+    let load = session.load_documents(&files)?;
     println!(
-        "Loaded {} ({} chars, {}, {})",
-        file.display(),
+        "Loaded {} file(s) ({} chars, {}, {})",
+        files.len(),
         load.chars,
         if load.fits_in_one_chunk { "fits in one chunk" } else { "will use map-reduce" },
-        if load.warm_from_disk { "warm from disk cache" } else { "cold - not seen before" }
+        if load.warm_from_disk { "a cached context is available on disk" } else { "cold - not seen before" }
     );
 
     if let Some(q) = question {
@@ -169,16 +229,26 @@ fn answer_and_print(session: &mut Session<OllamaClient>, question: &str) -> Resu
     for t in &report.timings {
         print!(", {}: {:.0}ms prompt_eval ({} tok)", t.label, t.prompt_eval_duration_ms, t.prompt_eval_count);
     }
+    if let Some(d) = report.adaptive_decision {
+        print!(
+            ", adaptive: predicted swap {:.0}ms vs raw {:.0}ms, chose {}",
+            d.predicted_swap_ms,
+            d.predicted_raw_ms,
+            if d.chose_swap { "swap" } else { "raw" }
+        );
+    }
     println!("]");
     Ok(())
 }
 
 fn run_bench(file: PathBuf, model: String, host: String, question: String) -> Result<()> {
     let cold_cache_path = std::env::temp_dir().join(format!("docuzent-bench-{}.redb", std::process::id()));
+    let cold_docling_cache_path = std::env::temp_dir().join(format!("docuzent-bench-docling-{}.redb", std::process::id()));
     let _ = std::fs::remove_file(&cold_cache_path); // guarantee a genuinely cold cache
+    let _ = std::fs::remove_file(&cold_docling_cache_path);
 
     println!("=== Cold run (no cache) ===");
-    let mut cold = open_session(&model, &host, &cold_cache_path)?;
+    let mut cold = open_session(&model, &host, Mode::Swap, None, &cold_cache_path, &cold_docling_cache_path)?;
     let load = cold.load_document(&file)?;
     assert!(!load.warm_from_disk, "bench requires a genuinely fresh cache path");
     let cold_report = cold.ask(&question)?;
@@ -188,7 +258,7 @@ fn run_bench(file: PathBuf, model: String, host: String, question: String) -> Re
     drop(cold); // release the cache file before reopening it
 
     println!("=== Warm run (fresh session, same cache file - simulates a process restart) ===");
-    let mut warm = open_session(&model, &host, &cold_cache_path)?;
+    let mut warm = open_session(&model, &host, Mode::Swap, None, &cold_cache_path, &cold_docling_cache_path)?;
     let load = warm.load_document(&file)?;
     assert!(load.warm_from_disk, "the cold run above should have persisted a context for this document");
     let warm_report = warm.ask(&question)?;
@@ -207,5 +277,6 @@ fn run_bench(file: PathBuf, model: String, host: String, question: String) -> Re
     }
 
     let _ = std::fs::remove_file(&cold_cache_path);
+    let _ = std::fs::remove_file(&cold_docling_cache_path);
     Ok(())
 }
