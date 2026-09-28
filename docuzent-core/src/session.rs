@@ -506,7 +506,7 @@ impl<G: Generator> Session<G> {
             }
 
             Ok(AnswerReport {
-                answer: resp.response.trim().to_string(),
+                answer: resp.text(),
                 used_map_reduce: false,
                 chunks_mapped: 0,
                 adaptive_decision,
@@ -551,7 +551,7 @@ impl<G: Generator> Session<G> {
                 timings.push(timing);
                 // Deliberately not persisting resp.context back to disk -
                 // see resolve_context's doc comment.
-                let text = resp.response.trim().to_string();
+                let text = resp.text();
                 if !text.eq_ignore_ascii_case("none") && !text.is_empty() {
                     extracted.push(text);
                 }
@@ -566,7 +566,7 @@ impl<G: Generator> Session<G> {
             timings.push(timing);
 
             Ok(AnswerReport {
-                answer: resp.response.trim().to_string(),
+                answer: resp.text(),
                 used_map_reduce: true,
                 chunks_mapped: pieces.len(),
                 adaptive_decision: None,
@@ -635,6 +635,7 @@ mod tests {
             };
             Ok(GenerateResponse {
                 response,
+                thinking: None,
                 context: new_context,
                 prompt_eval_count: prompt.len() as u64,
                 prompt_eval_duration: if context.is_some() { 1_000_000 } else { 100_000_000 },
