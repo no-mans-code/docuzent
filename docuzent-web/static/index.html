@@ -63,8 +63,25 @@
     color: var(--text);
     font-size: 0.95rem;
   }
-  input[type="text"]:focus, input[type="file"]:focus {
+  select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+  input[type="text"]:focus, input[type="file"]:focus, select:focus {
     outline: 2px solid var(--accent);
+  }
+  label {
+    font-size: 0.8rem;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 4px;
+  }
+  .field {
+    flex: 1;
   }
   button {
     background: var(--accent);
@@ -136,12 +153,34 @@
 <body>
 <main>
   <h1>docuzent</h1>
-  <p class="subtitle">Learn a document quickly — upload one file (or a .zip of them), then ask it anything.</p>
+  <p class="subtitle">Learn documents quickly — upload one or more files (or .zips of them), loaded together as one corpus, then ask anything.</p>
 
   <section class="panel">
     <div class="row">
-      <input type="file" id="fileInput" accept="*/*">
-      <button id="loadBtn">Load document</button>
+      <div class="field">
+        <label for="modelSelect">Model</label>
+        <select id="modelSelect"></select>
+      </div>
+      <div class="field">
+        <label for="modeSelect">Cache mode</label>
+        <select id="modeSelect">
+          <option value="adaptive">adaptive — predict swap vs. raw</option>
+          <option value="swap">swap — always reuse cached context</option>
+          <option value="raw">raw — never reuse, always cold</option>
+        </select>
+      </div>
+      <div class="field" style="flex: 0;">
+        <label>&nbsp;</label>
+        <button id="switchBtn">Apply</button>
+      </div>
+    </div>
+    <div class="status" id="switchStatus"></div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <input type="file" id="fileInput" accept="*/*" multiple>
+      <button id="loadBtn">Load document(s)</button>
     </div>
     <div class="status" id="loadStatus"></div>
   </section>
@@ -168,6 +207,10 @@ const askBtn = document.getElementById('askBtn');
 const askStatus = document.getElementById('askStatus');
 const transcript = document.getElementById('transcript');
 const modelInfo = document.getElementById('modelInfo');
+const modelSelect = document.getElementById('modelSelect');
+const modeSelect = document.getElementById('modeSelect');
+const switchBtn = document.getElementById('switchBtn');
+const switchStatus = document.getElementById('switchStatus');
 
 function setStatus(el, text, isError) {
   el.textContent = text;
@@ -175,17 +218,19 @@ function setStatus(el, text, isError) {
 }
 
 async function loadDocument() {
-  const file = fileInput.files[0];
-  if (!file) {
-    setStatus(loadStatus, 'Choose a file first.', true);
+  const files = Array.from(fileInput.files);
+  if (files.length === 0) {
+    setStatus(loadStatus, 'Choose at least one file first.', true);
     return;
   }
   loadBtn.disabled = true;
   setStatus(loadStatus, '', false);
-  loadStatus.innerHTML = '<span class="spinner"></span>Parsing via Docling — this can take a while for large PDFs…';
+  loadStatus.innerHTML = `<span class="spinner"></span>Parsing ${files.length} file(s) via Docling — this can take a while for large PDFs…`;
 
   const form = new FormData();
-  form.append('file', file, file.name);
+  for (const file of files) {
+    form.append('file', file, file.name);
+  }
 
   try {
     const resp = await fetch('/load', { method: 'POST', body: form });
@@ -196,7 +241,7 @@ async function loadDocument() {
     }
     setStatus(
       loadStatus,
-      `Loaded ${data.chars.toLocaleString()} chars — ${data.fits_in_one_chunk ? 'fits in one chunk' : 'will use map-reduce'} — ${data.warm_from_disk ? 'warm from disk cache' : 'cold, not seen before'}`,
+      `Loaded ${files.length} file(s), ${data.chars.toLocaleString()} chars — ${data.fits_in_one_chunk ? 'fits in one chunk' : 'will use map-reduce'} — ${data.warm_from_disk ? 'a cached context is available on disk' : 'cold, not seen before'}`,
       false
     );
     qaSection.style.display = 'block';
@@ -233,10 +278,13 @@ async function askQuestion() {
     turn.className = 'turn';
     const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(', ');
     const modeBit = data.used_map_reduce ? `map-reduce over ${data.chunks_mapped} chunks` : 'single chunk';
+    const adaptiveBit = data.adaptive_decision
+      ? ` — adaptive: predicted swap ${data.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${data.adaptive_decision.predicted_raw_ms.toFixed(0)}ms, chose ${data.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
+      : '';
     turn.innerHTML = `
       <div class="question">${escapeHtml(question)}</div>
       <div class="answer">${escapeHtml(data.answer)}</div>
-      <div class="meta">${modeBit} — ${metaBits}</div>
+      <div class="meta">${modeBit} — ${metaBits}${adaptiveBit}</div>
     `;
     transcript.prepend(turn);
     questionInput.value = '';
@@ -255,13 +303,81 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+async function refreshModelInfo() {
+  try {
+    const resp = await fetch('/model-info');
+    const d = await resp.json();
+    if (!d.ok) {
+      modelInfo.textContent = d.error || 'model info unavailable';
+      return;
+    }
+    modelInfo.textContent = `model: ${d.model} · mode: ${d.mode} · context window: ${d.context_length.toLocaleString()} tokens · cache: ${d.cache_path}`;
+    modelSelect.value = d.model;
+    modeSelect.value = d.mode;
+  } catch (e) {
+    modelInfo.textContent = 'model info unavailable: ' + e;
+  }
+}
+
+async function loadModelList() {
+  try {
+    const resp = await fetch('/models');
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(switchStatus, data.error || 'Failed to list models.', true);
+      return;
+    }
+    modelSelect.innerHTML = '';
+    for (const name of data.models) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      modelSelect.appendChild(opt);
+    }
+  } catch (e) {
+    setStatus(switchStatus, 'Request failed: ' + e, true);
+  }
+}
+
+async function switchModel() {
+  const model = modelSelect.value;
+  const mode = modeSelect.value;
+  if (!model) {
+    setStatus(switchStatus, 'Choose a model first.', true);
+    return;
+  }
+  switchBtn.disabled = true;
+  switchStatus.innerHTML = '<span class="spinner"></span>Switching…';
+  try {
+    const resp = await fetch('/model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, mode }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(switchStatus, data.error || 'Failed to switch.', true);
+      return;
+    }
+    setStatus(switchStatus, `Now using ${data.model} (${data.mode}, ${data.context_length.toLocaleString()} tokens). Load your document(s) again.`, false);
+    // Switching models replaces the session - whatever was loaded before
+    // is gone, so hide the Q&A section until something is loaded again.
+    qaSection.style.display = 'none';
+    transcript.innerHTML = '';
+    await refreshModelInfo();
+  } catch (e) {
+    setStatus(switchStatus, 'Request failed: ' + e, true);
+  } finally {
+    switchBtn.disabled = false;
+  }
+}
+
 loadBtn.addEventListener('click', loadDocument);
 askBtn.addEventListener('click', askQuestion);
+switchBtn.addEventListener('click', switchModel);
 questionInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') askQuestion(); });
 
-fetch('/model-info').then(r => r.json()).then(d => {
-  modelInfo.textContent = `model: ${d.model} · context window: ${d.context_length.toLocaleString()} tokens · cache: ${d.cache_path}`;
-}).catch(() => {});
+loadModelList().then(refreshModelInfo);
 </script>
 </body>
 </html>
