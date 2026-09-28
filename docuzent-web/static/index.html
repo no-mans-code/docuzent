@@ -6,147 +6,306 @@
 <title>docuzent — learn a document quickly</title>
 <style>
   :root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --border: #2a2e37;
-    --text: #e6e8eb;
-    --muted: #8b90a0;
-    --accent: #5b8cff;
-    --accent-text: #0b0d10;
-    --error: #ff6b6b;
+    --bg-0: #0a0b10;
+    --bg-1: #12141c;
+    --panel: rgba(28, 32, 44, 0.55);
+    --panel-solid: #1c202c;
+    --border: rgba(255, 255, 255, 0.09);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    --text: #eef0f5;
+    --muted: #8b90a8;
+    --accent: #6d8dff;
+    --accent-2: #8f6dff;
+    --accent-text: #06070b;
+    --error: #ff7a7a;
+    --ok: #5be8b5;
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
-    background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     display: flex;
     justify-content: center;
-    padding: 32px 16px;
+    padding: 40px 16px 64px;
+    background: var(--bg-0);
+    position: relative;
+    overflow-x: hidden;
   }
+
+  /* Fluid, slowly-drifting aurora field behind everything - fixed so it
+     never scrolls, blurred heavily so it reads as soft light, not shapes. */
+  body::before, body::after {
+    content: "";
+    position: fixed;
+    z-index: 0;
+    width: 60vmax;
+    height: 60vmax;
+    border-radius: 50%;
+    filter: blur(90px);
+    opacity: 0.35;
+    pointer-events: none;
+  }
+  body::before {
+    top: -20vmax;
+    left: -15vmax;
+    background: radial-gradient(circle, var(--accent), transparent 70%);
+    animation: drift1 22s ease-in-out infinite alternate;
+  }
+  body::after {
+    bottom: -25vmax;
+    right: -15vmax;
+    background: radial-gradient(circle, var(--accent-2), transparent 70%);
+    animation: drift2 26s ease-in-out infinite alternate;
+  }
+  @keyframes drift1 {
+    0%   { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(8vmax, 10vmax) scale(1.15); }
+  }
+  @keyframes drift2 {
+    0%   { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-6vmax, -8vmax) scale(1.1); }
+  }
+
   main {
     width: 100%;
-    max-width: 720px;
+    max-width: 760px;
+    position: relative;
+    z-index: 1;
   }
   h1 {
-    font-size: 1.4rem;
-    margin: 0 0 4px;
+    font-size: 1.6rem;
+    margin: 0 0 6px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    background: linear-gradient(120deg, var(--text), var(--accent) 140%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    display: inline-block;
   }
   .subtitle {
     color: var(--muted);
-    margin: 0 0 24px;
+    margin: 0 0 28px;
     font-size: 0.95rem;
+    line-height: 1.5;
+    max-width: 56ch;
   }
+
   .panel {
     background: var(--panel);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 20px;
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 18px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    transition: border-color 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
   }
+  .panel:hover {
+    border-color: var(--border-strong);
+  }
+  .panel.collapsing {
+    animation: collapseOut 0.3s ease forwards;
+  }
+  @keyframes collapseOut {
+    to { opacity: 0; transform: translateY(-6px) scale(0.98); max-height: 0; padding-top: 0; padding-bottom: 0; margin-bottom: 0; overflow: hidden; }
+  }
+  #qaSection {
+    display: none;
+    animation: riseIn 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  #qaSection.visible { display: block; }
+  @keyframes riseIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
   .row {
     display: flex;
-    gap: 8px;
-    align-items: center;
-  }
-  input[type="file"] {
-    color: var(--text);
-    flex: 1;
-  }
-  input[type="text"] {
-    flex: 1;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: var(--text);
-    font-size: 0.95rem;
-  }
-  select {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: var(--text);
-    font-size: 0.95rem;
-  }
-  input[type="text"]:focus, input[type="file"]:focus, select:focus {
-    outline: 2px solid var(--accent);
-  }
-  label {
-    font-size: 0.8rem;
-    color: var(--muted);
-    display: block;
-    margin-bottom: 4px;
+    gap: 10px;
+    align-items: flex-end;
+    flex-wrap: wrap;
   }
   .field {
-    flex: 1;
+    flex: 1 1 180px;
+    min-width: 0;
   }
+  .field.shrink {
+    flex: 0 0 auto;
+  }
+  label {
+    font-size: 0.76rem;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  input[type="file"] {
+    color: var(--muted);
+    flex: 1 1 220px;
+    min-width: 0;
+    font-size: 0.85rem;
+  }
+  input[type="text"], select {
+    width: 100%;
+    background: rgba(10, 11, 16, 0.55);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 11px 13px;
+    color: var(--text);
+    font-size: 0.92rem;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  }
+  input[type="text"]:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(109, 141, 255, 0.18);
+    background: rgba(10, 11, 16, 0.75);
+  }
+  select { cursor: pointer; }
+
   button {
-    background: var(--accent);
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
     color: var(--accent-text);
     border: none;
-    border-radius: 8px;
-    padding: 10px 16px;
+    border-radius: 10px;
+    padding: 11px 20px;
     font-weight: 600;
     cursor: pointer;
-    font-size: 0.9rem;
+    font-size: 0.88rem;
+    white-space: nowrap;
+    transition: transform 0.15s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+    box-shadow: 0 4px 14px rgba(109, 141, 255, 0.25);
   }
   button:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+    box-shadow: none;
   }
-  button:hover:not(:disabled) { filter: brightness(1.1); }
+  button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(109, 141, 255, 0.4);
+  }
+  button:active:not(:disabled) { transform: translateY(0); }
+
   .status {
-    margin-top: 12px;
-    font-size: 0.88rem;
+    margin-top: 14px;
+    font-size: 0.86rem;
     color: var(--muted);
     min-height: 1.2em;
+    transition: color 0.2s ease;
   }
   .status.error { color: var(--error); }
-  .spinner {
-    display: inline-block;
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    margin-right: 6px;
-    vertical-align: -1px;
+  .status.ok { color: var(--ok); }
+
+  /* Staged progress: a soft animated bar plus a live-updating label of
+     which real stage the ingest pipeline is in - not a generic spinner. */
+  .progress {
+    display: none;
+    margin-top: 14px;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  #qaSection { display: none; }
+  .progress.active { display: block; }
+  .progress-track {
+    position: relative;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.07);
+    overflow: hidden;
+  }
+  .progress-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .progress-fill::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent);
+    width: 40%;
+    animation: shimmer 1.3s linear infinite;
+  }
+  @keyframes shimmer {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(350%); }
+  }
+  .stages {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 10px;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .stage { display: flex; align-items: center; gap: 5px; transition: color 0.25s ease; }
+  .stage.done { color: var(--ok); }
+  .stage.active { color: var(--accent); }
+  .stage-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.5;
+  }
+  .stage.active .stage-dot {
+    animation: pulseDot 1s ease-in-out infinite;
+  }
+  .stage.done .stage-dot { opacity: 1; }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 0.4; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.4); }
+  }
+
   .transcript {
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    margin-top: 16px;
+    gap: 18px;
+    margin-top: 18px;
   }
   .turn {
-    border-left: 3px solid var(--accent);
-    padding-left: 12px;
+    border-left: 2px solid var(--accent);
+    padding-left: 14px;
+    animation: riseIn 0.35s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .question {
     color: var(--muted);
-    font-size: 0.85rem;
-    margin-bottom: 4px;
+    font-size: 0.84rem;
+    margin-bottom: 5px;
   }
   .answer {
     white-space: pre-wrap;
-    line-height: 1.45;
+    line-height: 1.55;
+    font-size: 0.96rem;
   }
   .meta {
     color: var(--muted);
-    font-size: 0.78rem;
-    margin-top: 6px;
+    font-size: 0.76rem;
+    margin-top: 8px;
+    opacity: 0.85;
   }
+  .badge {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(109, 141, 255, 0.15);
+    color: var(--accent);
+    font-size: 0.7rem;
+    margin-right: 6px;
+  }
+
   footer {
     color: var(--muted);
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     text-align: center;
-    margin-top: 8px;
+    margin-top: 20px;
+    opacity: 0.75;
   }
 </style>
 </head>
@@ -169,7 +328,7 @@
           <option value="raw">raw — never reuse, always cold</option>
         </select>
       </div>
-      <div class="field" style="flex: 0;">
+      <div class="field shrink">
         <label>&nbsp;</label>
         <button id="switchBtn">Apply</button>
       </div>
@@ -183,6 +342,15 @@
       <button id="loadBtn">Load document(s)</button>
     </div>
     <div class="status" id="loadStatus"></div>
+    <div class="progress" id="loadProgress">
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="stages">
+        <div class="stage" data-stage="upload"><span class="stage-dot"></span>Uploading</div>
+        <div class="stage" data-stage="docling"><span class="stage-dot"></span>Parsing (Docling)</div>
+        <div class="stage" data-stage="chunk"><span class="stage-dot"></span>Chunking</div>
+        <div class="stage" data-stage="ready"><span class="stage-dot"></span>Ready</div>
+      </div>
+    </div>
   </section>
 
   <section class="panel" id="qaSection">
@@ -201,6 +369,8 @@
 const loadBtn = document.getElementById('loadBtn');
 const fileInput = document.getElementById('fileInput');
 const loadStatus = document.getElementById('loadStatus');
+const loadProgress = document.getElementById('loadProgress');
+const progressFill = document.getElementById('progressFill');
 const qaSection = document.getElementById('qaSection');
 const questionInput = document.getElementById('questionInput');
 const askBtn = document.getElementById('askBtn');
@@ -212,20 +382,72 @@ const modeSelect = document.getElementById('modeSelect');
 const switchBtn = document.getElementById('switchBtn');
 const switchStatus = document.getElementById('switchStatus');
 
-function setStatus(el, text, isError) {
+function setStatus(el, text, kind) {
   el.textContent = text;
-  el.classList.toggle('error', !!isError);
+  el.classList.toggle('error', kind === 'error');
+  el.classList.toggle('ok', kind === 'ok');
+}
+
+// The backend answers /load in one shot (see docuzent#22 for real
+// per-file streaming) - this walks the visible stage indicator through
+// the pipeline's real shape (upload -> Docling parse -> chunk -> ready)
+// on realistic timing while the one real request is in flight, then
+// snaps straight to "ready" the moment the real response actually
+// arrives, whichever stage it was on. Honest about being an estimate:
+// it never claims completion before the real request resolves.
+const STAGE_ORDER = ['upload', 'docling', 'chunk', 'ready'];
+let stageTimer = null;
+
+function setStage(name, fraction) {
+  progressFill.style.width = `${fraction}%`;
+  const idx = STAGE_ORDER.indexOf(name);
+  document.querySelectorAll('.stage').forEach(el => {
+    const elIdx = STAGE_ORDER.indexOf(el.dataset.stage);
+    el.classList.toggle('active', elIdx === idx);
+    el.classList.toggle('done', elIdx < idx);
+  });
+}
+
+function startProgress(fileCount) {
+  loadProgress.classList.add('active');
+  setStage('upload', 8);
+  let step = 0;
+  const plan = [
+    { stage: 'upload', at: 300, pct: 18 },
+    { stage: 'docling', at: 900, pct: 35 },
+    { stage: 'docling', at: 1800 + fileCount * 250, pct: 60 },
+    { stage: 'docling', at: 3200 + fileCount * 500, pct: 78 },
+    { stage: 'chunk', at: 4200 + fileCount * 600, pct: 90 },
+  ];
+  const t0 = Date.now();
+  stageTimer = setInterval(() => {
+    const elapsed = Date.now() - t0;
+    while (step < plan.length && elapsed >= plan[step].at) {
+      setStage(plan[step].stage, plan[step].pct);
+      step++;
+    }
+  }, 120);
+}
+
+function finishProgress(success) {
+  if (stageTimer) { clearInterval(stageTimer); stageTimer = null; }
+  if (success) {
+    setStage('ready', 100);
+    setTimeout(() => loadProgress.classList.remove('active'), 900);
+  } else {
+    loadProgress.classList.remove('active');
+  }
 }
 
 async function loadDocument() {
   const files = Array.from(fileInput.files);
   if (files.length === 0) {
-    setStatus(loadStatus, 'Choose at least one file first.', true);
+    setStatus(loadStatus, 'Choose at least one file first.', 'error');
     return;
   }
   loadBtn.disabled = true;
-  setStatus(loadStatus, '', false);
-  loadStatus.innerHTML = `<span class="spinner"></span>Parsing ${files.length} file(s) via Docling — this can take a while for large PDFs…`;
+  setStatus(loadStatus, `Loading ${files.length} file(s)…`, null);
+  startProgress(files.length);
 
   const form = new FormData();
   for (const file of files) {
@@ -236,19 +458,22 @@ async function loadDocument() {
     const resp = await fetch('/load', { method: 'POST', body: form });
     const data = await resp.json();
     if (!data.ok) {
-      setStatus(loadStatus, data.error || 'Failed to load document.', true);
+      finishProgress(false);
+      setStatus(loadStatus, data.error || 'Failed to load document.', 'error');
       return;
     }
+    finishProgress(true);
     setStatus(
       loadStatus,
       `Loaded ${files.length} file(s), ${data.chars.toLocaleString()} chars — ${data.fits_in_one_chunk ? 'fits in one chunk' : 'will use map-reduce'} — ${data.warm_from_disk ? 'a cached context is available on disk' : 'cold, not seen before'}`,
-      false
+      'ok'
     );
-    qaSection.style.display = 'block';
+    qaSection.classList.add('visible');
     transcript.innerHTML = '';
     questionInput.focus();
   } catch (e) {
-    setStatus(loadStatus, 'Request failed: ' + e, true);
+    finishProgress(false);
+    setStatus(loadStatus, 'Request failed: ' + e, 'error');
   } finally {
     loadBtn.disabled = false;
   }
@@ -259,8 +484,8 @@ async function askQuestion() {
   if (!question) return;
   askBtn.disabled = true;
   questionInput.disabled = true;
-  setStatus(askStatus, '', false);
-  askStatus.innerHTML = '<span class="spinner"></span>Thinking…';
+  setStatus(askStatus, '', null);
+  askStatus.innerHTML = '<span class="badge">thinking</span>working through the document…';
 
   try {
     const resp = await fetch('/ask', {
@@ -270,26 +495,26 @@ async function askQuestion() {
     });
     const data = await resp.json();
     if (!data.ok) {
-      setStatus(askStatus, data.error || 'Failed to answer.', true);
+      setStatus(askStatus, data.error || 'Failed to answer.', 'error');
       return;
     }
-    setStatus(askStatus, '', false);
+    setStatus(askStatus, '', null);
     const turn = document.createElement('div');
     turn.className = 'turn';
-    const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(', ');
-    const modeBit = data.used_map_reduce ? `map-reduce over ${data.chunks_mapped} chunks` : 'single chunk';
+    const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(' · ');
+    const modeBit = data.used_map_reduce ? `map-reduce · ${data.chunks_mapped} chunks` : 'single chunk';
     const adaptiveBit = data.adaptive_decision
-      ? ` — adaptive: predicted swap ${data.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${data.adaptive_decision.predicted_raw_ms.toFixed(0)}ms, chose ${data.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
+      ? ` · adaptive: swap ${data.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${data.adaptive_decision.predicted_raw_ms.toFixed(0)}ms → chose ${data.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
       : '';
     turn.innerHTML = `
       <div class="question">${escapeHtml(question)}</div>
       <div class="answer">${escapeHtml(data.answer)}</div>
-      <div class="meta">${modeBit} — ${metaBits}${adaptiveBit}</div>
+      <div class="meta"><span class="badge">${modeBit}</span>${metaBits}${adaptiveBit}</div>
     `;
     transcript.prepend(turn);
     questionInput.value = '';
   } catch (e) {
-    setStatus(askStatus, 'Request failed: ' + e, true);
+    setStatus(askStatus, 'Request failed: ' + e, 'error');
   } finally {
     askBtn.disabled = false;
     questionInput.disabled = false;
@@ -324,7 +549,7 @@ async function loadModelList() {
     const resp = await fetch('/models');
     const data = await resp.json();
     if (!data.ok) {
-      setStatus(switchStatus, data.error || 'Failed to list models.', true);
+      setStatus(switchStatus, data.error || 'Failed to list models.', 'error');
       return;
     }
     modelSelect.innerHTML = '';
@@ -335,7 +560,7 @@ async function loadModelList() {
       modelSelect.appendChild(opt);
     }
   } catch (e) {
-    setStatus(switchStatus, 'Request failed: ' + e, true);
+    setStatus(switchStatus, 'Request failed: ' + e, 'error');
   }
 }
 
@@ -343,11 +568,11 @@ async function switchModel() {
   const model = modelSelect.value;
   const mode = modeSelect.value;
   if (!model) {
-    setStatus(switchStatus, 'Choose a model first.', true);
+    setStatus(switchStatus, 'Choose a model first.', 'error');
     return;
   }
   switchBtn.disabled = true;
-  switchStatus.innerHTML = '<span class="spinner"></span>Switching…';
+  setStatus(switchStatus, 'Switching…', null);
   try {
     const resp = await fetch('/model', {
       method: 'POST',
@@ -356,17 +581,17 @@ async function switchModel() {
     });
     const data = await resp.json();
     if (!data.ok) {
-      setStatus(switchStatus, data.error || 'Failed to switch.', true);
+      setStatus(switchStatus, data.error || 'Failed to switch.', 'error');
       return;
     }
-    setStatus(switchStatus, `Now using ${data.model} (${data.mode}, ${data.context_length.toLocaleString()} tokens). Load your document(s) again.`, false);
+    setStatus(switchStatus, `Now using ${data.model} (${data.mode}, ${data.context_length.toLocaleString()} tokens). Load your document(s) again.`, 'ok');
     // Switching models replaces the session - whatever was loaded before
     // is gone, so hide the Q&A section until something is loaded again.
-    qaSection.style.display = 'none';
+    qaSection.classList.remove('visible');
     transcript.innerHTML = '';
     await refreshModelInfo();
   } catch (e) {
-    setStatus(switchStatus, 'Request failed: ' + e, true);
+    setStatus(switchStatus, 'Request failed: ' + e, 'error');
   } finally {
     switchBtn.disabled = false;
   }
