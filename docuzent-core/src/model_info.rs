@@ -29,6 +29,29 @@ pub struct ModelInfo {
     pub parameter_size: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<TagsModel>,
+}
+
+#[derive(Deserialize)]
+struct TagsModel {
+    name: String,
+}
+
+/// Lists every model this Ollama server has locally pulled - for a UI to
+/// offer a real choice from, rather than a model being fixed at startup.
+pub fn list_models(host: &str) -> Result<Vec<String>> {
+    let url = format!("{}/api/tags", host.trim_end_matches('/'));
+    let resp: TagsResponse = ureq::get(&url)
+        .call()
+        .with_context(|| format!("ollama tags request to {url} failed - is `ollama serve` running?"))?
+        .into_json()
+        .context("failed to parse ollama tags response")?;
+    Ok(resp.models.into_iter().map(|m| m.name).collect())
+}
+
 /// Fetches `model`'s real context window (and parameter size, if Ollama
 /// reports one) from `host`'s `/api/show`.
 pub fn model_info(host: &str, model: &str) -> Result<ModelInfo> {
