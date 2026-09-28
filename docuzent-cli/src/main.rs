@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
 use docuzent_core::ingest::{self, IngestOptions};
-use docuzent_core::session::{infer_context_length, Mode, Session};
+use docuzent_core::session::{Mode, Session};
+use docuzent_core::vram::ModelVramEstimate;
 use kvcache::Cache;
 
 /// docuzent - local document-intelligence CLI
@@ -146,6 +147,40 @@ fn run_ingest(
     Ok(())
 }
 
+/// Reports the real numbers behind the context-length decision - not just
+/// the final value, so a user sees *why* it's smaller than the model's
+/// nominal window when it is, rather than silently getting a different
+/// number than they might have expected. See
+/// https://github.com/no-mans-code/docuzent/issues/30.
+fn print_context_length_report(model: &str, context_length: u32, overridden: bool, estimate: &ModelVramEstimate) {
+    if overridden {
+        println!("Model `{model}` context window: {context_length} tokens (explicit override - nominal window is {})", estimate.nominal_context_length);
+        return;
+    }
+    if context_length == estimate.nominal_context_length {
+        println!("Model `{model}` context window: {context_length} tokens");
+        return;
+    }
+    println!("Model `{model}` context window: {context_length} tokens (safe default, not the nominal {})", estimate.nominal_context_length);
+    if let Some(trained) = estimate.original_context_length {
+        if trained != estimate.nominal_context_length {
+            println!("  - nominal window is a RoPE-scaling extrapolation; the model was actually trained on {trained} tokens");
+        }
+    }
+    match estimate.vram_free_bytes {
+        Some(free) if context_length < estimate.original_context_length.unwrap_or(estimate.nominal_context_length) => {
+            println!(
+                "  - capped further to fit free VRAM (~{:.1} GB free, model weights ~{:.1} GB) - large documents will use map-reduce",
+                free as f64 / 1e9,
+                estimate.weight_bytes as f64 / 1e9
+            );
+        }
+        None => println!("  - free VRAM couldn't be measured (no NVIDIA GPU detected) - using the model's trained context as-is"),
+        _ => {}
+    }
+    println!("  - override with --context-length to use a different value");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_session(
     model: &str,
@@ -156,12 +191,9 @@ fn open_session(
     cache_path: &PathBuf,
     docling_cache_path: &PathBuf,
 ) -> Result<Session<OllamaClient>> {
-    let context_length = match context_length_override {
-        Some(n) => n,
-        None => infer_context_length(host, model)
-            .with_context(|| format!("failed to infer context size for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?,
-    };
-    println!("Model `{model}` context window: {context_length} tokens");
+    let (context_length, estimate) = docuzent_core::vram::resolve_context_length(host, model, context_length_override)
+        .with_context(|| format!("failed to size context window for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?;
+    print_context_length_report(model, context_length, context_length_override.is_some(), &estimate);
 
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).ok();

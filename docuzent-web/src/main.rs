@@ -10,7 +10,8 @@ use axum::Router;
 use clap::Parser;
 use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
-use docuzent_core::session::{infer_context_length, Mode, Session};
+use docuzent_core::session::{Mode, Session};
+use docuzent_core::vram;
 use kvcache::Cache;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,18 @@ struct Cli {
     /// Port to listen on
     #[arg(long, default_value_t = 3000)]
     port: u16,
+    /// Maximum number of session requests (/load, /ask) allowed to run at
+    /// once - a fair, FIFO-queued admission gate (`tokio::sync::Semaphore`),
+    /// not an accident of mutex contention. Defaults to 1: there is
+    /// exactly one active document/model at a time by design (loading a
+    /// new document evicts the previous one - see `Session::load_documents`),
+    /// so raising this without also building a real multi-session pool
+    /// (tracked separately, not yet built - see
+    /// https://github.com/no-mans-code/docuzent/issues/32) just means
+    /// concurrent callers stomp on the same document: real thrashing
+    /// (repeated cache eviction), not real parallelism.
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_requests: usize,
 }
 
 /// Everything that changes together when the active model (or mode)
@@ -67,13 +80,47 @@ struct SessionState {
     mode_label: String,
     context_length: u32,
     map_reduce_context_fraction: f32,
+    /// The real VRAM picture behind `context_length` - see
+    /// `docuzent_core::vram`. Kept alongside the session so `/model-info`
+    /// can report it without a second round-trip to Ollama.
+    vram_estimate: vram::ModelVramEstimate,
+}
+
+/// An *estimated* ingestion-progress snapshot, set right before a
+/// potentially-slow prime call starts and cleared when it finishes - see
+/// `GET /progress`. Real-data-driven (from `Session`'s own measured speed
+/// profile), never fabricated: `tokens_per_sec` is `0.0` when nothing has
+/// been measured yet for this `(model, context_length)`, in which case
+/// the frontend shows an indeterminate state rather than a fake rate.
+struct ProgressSnapshot {
+    total_estimated_tokens: u64,
+    tokens_per_sec: f64,
+    started_at: std::time::Instant,
+    label: String,
 }
 
 struct AppState {
     state: Mutex<Option<SessionState>>,
+    progress: Mutex<Option<ProgressSnapshot>>,
+    /// Fair (FIFO), explicit admission gate for `/load` and `/ask` - see
+    /// `Cli::max_concurrent_requests` and
+    /// https://github.com/no-mans-code/docuzent/issues/32. Replaces
+    /// relying on `std::sync::Mutex` contention alone, which makes no
+    /// fairness guarantee.
+    request_gate: tokio::sync::Semaphore,
     host: String,
     cache_path: PathBuf,
     docling_cache_path: PathBuf,
+}
+
+/// Waits for a free slot in `gate`, returning the held permit alongside
+/// how long this call actually waited - real, measured, not guessed. The
+/// permit must be kept alive (bound to a variable, not `_`) until the
+/// gated work is done.
+async fn acquire_gate(gate: &tokio::sync::Semaphore) -> (tokio::sync::SemaphorePermit<'_>, u64) {
+    let start = std::time::Instant::now();
+    let permit = gate.acquire().await.expect("request_gate semaphore is never closed");
+    (permit, start.elapsed().as_millis() as u64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87,12 +134,14 @@ fn open_session_state(
     docling_cache_path: &PathBuf,
 ) -> Result<SessionState> {
     let mode = Mode::parse(mode_label)?;
-    let context_length = match context_length_override {
-        Some(n) => n,
-        None => infer_context_length(host, model)
-            .with_context(|| format!("failed to infer context size for `{model}` - is `ollama serve` running and has it been pulled?"))?,
-    };
-    println!("Model `{model}` context window: {context_length} tokens");
+    // Defaults to a VRAM/trained-context-aware safe size, not the model's
+    // raw nominal window - see docuzent_core::vram's module docs for the
+    // real, already-observed failure this prevents (a 24B model's RoPE-
+    // extrapolated nominal context crashing Ollama outright). An explicit
+    // override (CLI flag, or the web UI's slider) always wins.
+    let (context_length, vram_estimate) = vram::resolve_context_length(host, model, context_length_override)
+        .with_context(|| format!("failed to size context window for `{model}` - is `ollama serve` running and has it been pulled?"))?;
+    println!("Model `{model}` context window: {context_length} tokens (nominal {}, safe default {})", vram_estimate.nominal_context_length, vram_estimate.safe_context_length);
 
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -109,7 +158,7 @@ fn open_session_state(
     std::fs::create_dir_all(&upload_dir).ok();
 
     let session = Session::open(OllamaClient::new(host, model, context_length), model, context_length, upload_dir, mode, map_reduce_context_fraction, cache, docling_cache)?;
-    Ok(SessionState { session, model: model.to_string(), mode_label: mode_label.to_string(), context_length, map_reduce_context_fraction })
+    Ok(SessionState { session, model: model.to_string(), mode_label: mode_label.to_string(), context_length, map_reduce_context_fraction, vram_estimate })
 }
 
 #[tokio::main]
@@ -123,6 +172,8 @@ async fn main() -> Result<()> {
 
     let state = std::sync::Arc::new(AppState {
         state: Mutex::new(Some(session_state)),
+        progress: Mutex::new(None),
+        request_gate: tokio::sync::Semaphore::new(cli.max_concurrent_requests.max(1)),
         host: cli.host.clone(),
         cache_path: cli.cache.clone(),
         docling_cache_path: cli.docling_cache.clone(),
@@ -132,9 +183,11 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/model-info", get(model_info_handler))
         .route("/models", get(models_handler))
+        .route("/context-estimate", get(context_estimate_handler))
         .route("/model", post(switch_model_handler))
         .route("/load", post(load_handler))
         .route("/ask", post(ask_handler))
+        .route("/progress", get(progress_handler))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
 
@@ -157,6 +210,61 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
+/// The VRAM picture for one model - shared shape across `/model-info`,
+/// `POST /model`'s response, and `GET /context-estimate`, so the frontend
+/// slider logic is the same regardless of which endpoint produced it (the
+/// currently active session's real numbers, vs. a candidate model the
+/// user is considering switching to).
+#[derive(Serialize, Clone)]
+struct VramFields {
+    nominal_context_length: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_context_length: Option<u32>,
+    safe_context_length: u32,
+    weight_bytes: u64,
+    kv_bytes_per_token: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram_free_bytes: Option<u64>,
+    /// So the frontend's live slider estimate (`weight_bytes +
+    /// kv_bytes_per_token * tokens + overhead_bytes`) matches the
+    /// backend's own formula exactly, rather than a second hardcoded copy
+    /// of the same constant drifting out of sync with it.
+    overhead_bytes: u64,
+    safety_fraction: f64,
+}
+
+impl From<&vram::ModelVramEstimate> for VramFields {
+    fn from(e: &vram::ModelVramEstimate) -> Self {
+        Self {
+            nominal_context_length: e.nominal_context_length,
+            original_context_length: e.original_context_length,
+            safe_context_length: e.safe_context_length,
+            weight_bytes: e.weight_bytes,
+            kv_bytes_per_token: e.kv_bytes_per_token,
+            vram_free_bytes: e.vram_free_bytes,
+            overhead_bytes: vram::FIXED_OVERHEAD_BYTES,
+            safety_fraction: vram::DEFAULT_VRAM_SAFETY_FRACTION,
+        }
+    }
+}
+
+/// Ground truth (not an estimate), from Ollama's own `/api/ps`: `None`
+/// when it can't be measured, or when there's nothing to warn about.
+fn ram_offload_warning(host: &str, model: &str) -> Option<String> {
+    let fraction = vram::real_vram_fraction(host, model)?;
+    (fraction < RAM_OFFLOAD_WARNING_THRESHOLD).then(|| {
+        format!(
+            "{:.0}% of `{model}` is resident in VRAM right now (measured, not estimated) - the rest is running from system RAM, which is why generation is slower than usual.",
+            fraction * 100.0
+        )
+    })
+}
+
+/// Below this fraction resident in VRAM, worth surfacing as a real,
+/// measured warning - small numerical slop under 1.0 from measurement
+/// rounding shouldn't itself count as offload.
+const RAM_OFFLOAD_WARNING_THRESHOLD: f64 = 0.97;
+
 #[derive(Serialize)]
 struct ModelInfoResponse {
     ok: bool,
@@ -172,28 +280,44 @@ struct ModelInfoResponse {
     map_reduce_context_fraction: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram: Option<VramFields>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_offload_warning: Option<String>,
 }
 
 async fn model_info_handler(State(state): State<std::sync::Arc<AppState>>) -> impl IntoResponse {
-    let guard = state.state.lock().unwrap();
-    match guard.as_ref() {
-        Some(s) => (
-            StatusCode::OK,
-            Json(ModelInfoResponse {
-                ok: true,
-                error: None,
-                model: Some(s.model.clone()),
-                mode: Some(s.mode_label.clone()),
-                context_length: Some(s.context_length),
-                map_reduce_context_fraction: Some(s.map_reduce_context_fraction),
-                cache_path: Some(state.cache_path.display().to_string()),
-            }),
-        ),
-        None => (
+    let (model, host, snapshot) = {
+        let guard = state.state.lock().unwrap();
+        match guard.as_ref() {
+            Some(s) => (s.model.clone(), state.host.clone(), Some((s.mode_label.clone(), s.context_length, s.map_reduce_context_fraction, VramFields::from(&s.vram_estimate)))),
+            None => (String::new(), state.host.clone(), None),
+        }
+    };
+    let Some((mode_label, context_length, map_reduce_context_fraction, vram_fields)) = snapshot else {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ModelInfoResponse { ok: false, error: Some("session is switching models right now".to_string()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None, cache_path: None }),
-        ),
-    }
+            Json(ModelInfoResponse { ok: false, error: Some("session is switching models right now".to_string()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None, cache_path: None, vram: None, ram_offload_warning: None }),
+        );
+    };
+    // A real, live /api/ps check - cheap and local, but still a blocking
+    // HTTP call, so it's kept off the async runtime's worker thread.
+    let model_for_warning = model.clone();
+    let warning = tokio::task::spawn_blocking(move || ram_offload_warning(&host, &model_for_warning)).await.ok().flatten();
+    (
+        StatusCode::OK,
+        Json(ModelInfoResponse {
+            ok: true,
+            error: None,
+            model: Some(model),
+            mode: Some(mode_label),
+            context_length: Some(context_length),
+            map_reduce_context_fraction: Some(map_reduce_context_fraction),
+            cache_path: Some(state.cache_path.display().to_string()),
+            vram: Some(vram_fields),
+            ram_offload_warning: warning,
+        }),
+    )
 }
 
 #[derive(Serialize)]
@@ -214,6 +338,78 @@ async fn models_handler(State(state): State<std::sync::Arc<AppState>>) -> impl I
         Ok(Ok(models)) => (StatusCode::OK, Json(ModelsResponse { ok: true, error: None, models: Some(models) })),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ModelsResponse { ok: false, error: Some(e.to_string()), models: None })),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ModelsResponse { ok: false, error: Some(e.to_string()), models: None })),
+    }
+}
+
+#[derive(Deserialize)]
+struct ContextEstimateQuery {
+    model: String,
+}
+
+#[derive(Serialize)]
+struct ContextEstimateResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram: Option<VramFields>,
+}
+
+/// The VRAM picture for a *candidate* model - independent of whichever
+/// session is currently active, so the web UI's context-size slider can
+/// show real bounds/estimates for a model the user is considering
+/// switching to, before they click Apply. See
+/// https://github.com/no-mans-code/docuzent/issues/29.
+async fn context_estimate_handler(State(state): State<std::sync::Arc<AppState>>, axum::extract::Query(q): axum::extract::Query<ContextEstimateQuery>) -> impl IntoResponse {
+    let host = state.host.clone();
+    let model = q.model.clone();
+    let result = tokio::task::spawn_blocking(move || vram::estimate_for_model(&host, &model)).await;
+    match result {
+        Ok(Ok(estimate)) => (StatusCode::OK, Json(ContextEstimateResponse { ok: true, error: None, model: Some(q.model), vram: Some(VramFields::from(&estimate)) })),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ContextEstimateResponse { ok: false, error: Some(e.to_string()), model: None, vram: None })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ContextEstimateResponse { ok: false, error: Some(e.to_string()), model: None, vram: None })),
+    }
+}
+
+#[derive(Serialize)]
+struct ProgressResponse {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_tokens_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_tokens_done: Option<u64>,
+    /// `0.0` when nothing has been measured for this `(model,
+    /// context_length)` yet - the frontend shows an indeterminate state
+    /// rather than pretending to know a rate, per
+    /// https://github.com/no-mans-code/docuzent/issues/30.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+/// Ollama's API exposes no live prefill-progress signal - this is an
+/// *estimate*, computed from `elapsed × the session's own real measured
+/// throughput` (see `Session::estimated_prefill_tokens_per_sec`), polled
+/// by the frontend while a `/load` or `/ask` request that might be doing
+/// a slow cold prime is in flight.
+async fn progress_handler(State(state): State<std::sync::Arc<AppState>>) -> impl IntoResponse {
+    let guard = state.progress.lock().unwrap();
+    match guard.as_ref() {
+        Some(p) => {
+            let elapsed = p.started_at.elapsed().as_secs_f64();
+            let estimated_tokens_done = if p.tokens_per_sec > 0.0 { ((elapsed * p.tokens_per_sec) as u64).min(p.total_estimated_tokens) } else { 0 };
+            Json(ProgressResponse {
+                active: true,
+                estimated_tokens_total: Some(p.total_estimated_tokens),
+                estimated_tokens_done: Some(estimated_tokens_done),
+                tokens_per_sec: Some(p.tokens_per_sec),
+                label: Some(p.label.clone()),
+            })
+        }
+        None => Json(ProgressResponse { active: false, estimated_tokens_total: None, estimated_tokens_done: None, tokens_per_sec: None, label: None }),
     }
 }
 
@@ -241,10 +437,12 @@ struct SwitchModelResponse {
     context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     map_reduce_context_fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram: Option<VramFields>,
 }
 
 fn switch_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<SwitchModelResponse>) {
-    (status, Json(SwitchModelResponse { ok: false, error: Some(message.into()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None }))
+    (status, Json(SwitchModelResponse { ok: false, error: Some(message.into()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None, vram: None }))
 }
 
 /// Switches the active model (and optionally mode/context length/
@@ -281,6 +479,7 @@ async fn switch_model_handler(State(state): State<std::sync::Arc<AppState>>, Jso
                 mode: Some(new_state.mode_label.clone()),
                 context_length: Some(new_state.context_length),
                 map_reduce_context_fraction: Some(new_state.map_reduce_context_fraction),
+                vram: Some(VramFields::from(&new_state.vram_estimate)),
             };
             *state.state.lock().unwrap() = Some(new_state);
             (StatusCode::OK, Json(response))
@@ -301,10 +500,15 @@ struct LoadResponse {
     fits_in_one_chunk: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warm_from_disk: Option<bool>,
+    /// Real, measured milliseconds this request waited for a free slot
+    /// behind `--max-concurrent-requests` other in-flight requests - `0`
+    /// when uncontended. See
+    /// https://github.com/no-mans-code/docuzent/issues/32.
+    queued_ms: u64,
 }
 
-fn load_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<LoadResponse>) {
-    (status, Json(LoadResponse { ok: false, error: Some(message.into()), chars: None, fits_in_one_chunk: None, warm_from_disk: None }))
+fn load_error(status: StatusCode, message: impl Into<String>, queued_ms: u64) -> (StatusCode, Json<LoadResponse>) {
+    (status, Json(LoadResponse { ok: false, error: Some(message.into()), chars: None, fits_in_one_chunk: None, warm_from_disk: None, queued_ms }))
 }
 
 /// Accepts one or more files in a single multipart request, saving each
@@ -313,31 +517,42 @@ async fn load_handler(
     State(state): State<std::sync::Arc<AppState>>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let (_permit, queued_ms) = acquire_gate(&state.request_gate).await;
     let upload_dir = std::env::temp_dir().join("docuzent-web-uploads");
     std::fs::create_dir_all(&upload_dir).ok();
 
     let mut dests = Vec::new();
+    let mut text_only = false;
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return load_error(StatusCode::BAD_REQUEST, e.to_string()),
+            Err(e) => return load_error(StatusCode::BAD_REQUEST, e.to_string(), queued_ms),
         };
+        // A plain form field (no filename) named `text_only` toggles
+        // skipping Docling entirely, for files that are already text
+        // (.txt, .md, .log, config, source code) - see
+        // https://github.com/no-mans-code/docuzent/issues/27.
+        if field.name() == Some("text_only") && field.file_name().is_none() {
+            let value = field.text().await.unwrap_or_default();
+            text_only = value == "true" || value == "1" || value == "on";
+            continue;
+        }
         let original_name = field.file_name().unwrap_or("upload").to_string();
         let safe_name = sanitize_filename(&original_name);
         let bytes = match field.bytes().await {
             Ok(b) => b,
-            Err(e) => return load_error(StatusCode::BAD_REQUEST, e.to_string()),
+            Err(e) => return load_error(StatusCode::BAD_REQUEST, e.to_string(), queued_ms),
         };
         let dest = upload_dir.join(&safe_name);
         if let Err(e) = std::fs::write(&dest, &bytes) {
-            return load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            return load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms);
         }
         dests.push(dest);
     }
 
     if dests.is_empty() {
-        return load_error(StatusCode::BAD_REQUEST, "no file in request");
+        return load_error(StatusCode::BAD_REQUEST, "no file in request", queued_ms);
     }
 
     let result = tokio::task::spawn_blocking({
@@ -347,7 +562,7 @@ async fn load_handler(
             let Some(session_state) = guard.as_mut() else {
                 anyhow::bail!("session is switching models right now - try again in a moment");
             };
-            session_state.session.load_documents(&dests)
+            if text_only { session_state.session.load_text_files(&dests) } else { session_state.session.load_documents(&dests) }
         }
     })
     .await;
@@ -361,10 +576,11 @@ async fn load_handler(
                 chars: Some(report.chars),
                 fits_in_one_chunk: Some(report.fits_in_one_chunk),
                 warm_from_disk: Some(report.warm_from_disk),
+                queued_ms,
             }),
         ),
-        Ok(Err(e)) => load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Ok(Err(e)) => load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
+        Err(e) => load_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
     }
 }
 
@@ -388,16 +604,43 @@ struct AskResponse {
     adaptive_decision: Option<docuzent_core::session::AdaptiveDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timings: Option<Vec<docuzent_core::session::CallTiming>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_offload_warning: Option<String>,
+    /// Real, measured milliseconds this request waited for a free slot
+    /// behind `--max-concurrent-requests` other in-flight requests - `0`
+    /// when uncontended. See
+    /// https://github.com/no-mans-code/docuzent/issues/32.
+    queued_ms: u64,
 }
 
-fn ask_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<AskResponse>) {
+fn ask_error(status: StatusCode, message: impl Into<String>, queued_ms: u64) -> (StatusCode, Json<AskResponse>) {
     (
         status,
-        Json(AskResponse { ok: false, error: Some(message.into()), answer: None, used_map_reduce: None, chunks_mapped: None, adaptive_decision: None, timings: None }),
+        Json(AskResponse { ok: false, error: Some(message.into()), answer: None, used_map_reduce: None, chunks_mapped: None, adaptive_decision: None, timings: None, ram_offload_warning: None, queued_ms }),
     )
 }
 
 async fn ask_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<AskRequest>) -> impl IntoResponse {
+    let (_permit, queued_ms) = acquire_gate(&state.request_gate).await;
+    let model = {
+        let guard = state.state.lock().unwrap();
+        let Some(session_state) = guard.as_ref() else {
+            return ask_error(StatusCode::SERVICE_UNAVAILABLE, "session is switching models right now - try again in a moment", queued_ms);
+        };
+        // An *estimate*, from this session's own real measured throughput
+        // (0.0 if nothing measured yet for this model/context length) -
+        // see `ProgressSnapshot`'s doc comment and
+        // https://github.com/no-mans-code/docuzent/issues/30. Total is
+        // whatever's currently loaded, not necessarily what this
+        // particular question's map-reduce chunking will touch, but it's
+        // the best estimate available before the real call starts.
+        let total_estimated_tokens = (session_state.session.current_text_len_chars().unwrap_or(0) / docuzent_core::session::CHARS_PER_TOKEN).max(1) as u64;
+        let tokens_per_sec = session_state.session.estimated_prefill_tokens_per_sec().unwrap_or(0.0);
+        *state.progress.lock().unwrap() = Some(ProgressSnapshot { total_estimated_tokens, tokens_per_sec, started_at: std::time::Instant::now(), label: "answering".to_string() });
+        session_state.model.clone()
+    };
+    let host = state.host.clone();
+
     let result = tokio::task::spawn_blocking({
         let state = state.clone();
         move || {
@@ -410,21 +653,28 @@ async fn ask_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): J
     })
     .await;
 
+    *state.progress.lock().unwrap() = None;
+
     match result {
-        Ok(Ok(report)) => (
-            StatusCode::OK,
-            Json(AskResponse {
-                ok: true,
-                error: None,
-                answer: Some(report.answer),
-                used_map_reduce: Some(report.used_map_reduce),
-                chunks_mapped: Some(report.chunks_mapped),
-                adaptive_decision: report.adaptive_decision,
-                timings: Some(report.timings),
-            }),
-        ),
-        Ok(Err(e)) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Ok(Ok(report)) => {
+            let warning = tokio::task::spawn_blocking(move || ram_offload_warning(&host, &model)).await.ok().flatten();
+            (
+                StatusCode::OK,
+                Json(AskResponse {
+                    ok: true,
+                    error: None,
+                    answer: Some(report.answer),
+                    used_map_reduce: Some(report.used_map_reduce),
+                    chunks_mapped: Some(report.chunks_mapped),
+                    adaptive_decision: report.adaptive_decision,
+                    timings: Some(report.timings),
+                    ram_offload_warning: warning,
+                    queued_ms,
+                }),
+            )
+        }
+        Ok(Err(e)) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
+        Err(e) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
     }
 }
 
@@ -437,5 +687,81 @@ fn sanitize_filename(name: &str) -> String {
         "upload".to_string()
     } else {
         base.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The core claim behind issue #32: a second caller genuinely waits
+    /// for a busy gate, and the wait is *measured*, not guessed. No live
+    /// model needed - this exercises `acquire_gate` directly against a
+    /// real `tokio::sync::Semaphore`.
+    #[tokio::test]
+    async fn acquire_gate_reports_a_real_wait_time_when_contended() {
+        let gate = tokio::sync::Semaphore::new(1);
+        let (first_permit, first_wait) = acquire_gate(&gate).await;
+        assert_eq!(first_wait, 0, "the first caller on an empty gate never waits");
+
+        const HOLD_MS: u64 = 200;
+        let waiter = acquire_gate(&gate);
+        let holder = async {
+            tokio::time::sleep(std::time::Duration::from_millis(HOLD_MS)).await;
+            drop(first_permit);
+        };
+        let ((_second_permit, second_wait), _) = tokio::join!(waiter, holder);
+
+        // Real measured wait, not exact to the millisecond - allow slack
+        // for scheduler jitter in both directions.
+        assert!(second_wait >= HOLD_MS.saturating_sub(50), "expected to wait close to {HOLD_MS}ms, actually waited {second_wait}ms");
+    }
+
+    #[tokio::test]
+    async fn acquire_gate_is_immediate_when_the_gate_has_room() {
+        let gate = tokio::sync::Semaphore::new(2);
+        let (_a, wait_a) = acquire_gate(&gate).await;
+        let (_b, wait_b) = acquire_gate(&gate).await;
+        assert_eq!(wait_a, 0);
+        assert_eq!(wait_b, 0, "a second permit within capacity must not wait on the first");
+    }
+
+    /// Same shape as `AppState::request_gate`'s default (see
+    /// `Cli::max_concurrent_requests`'s doc comment) - with capacity 1,
+    /// a and b and c only ever run one at a time, in submission order:
+    /// c can't jump ahead of b just because a happens to release first.
+    /// The real total wall time (a's hold, then b's hold, then c
+    /// finally getting in) is the honest proof, not any single queued_ms
+    /// reading in isolation.
+    #[tokio::test]
+    async fn three_callers_on_a_single_permit_run_strictly_one_at_a_time() {
+        let gate = tokio::sync::Semaphore::new(1);
+        const HOLD_MS: u64 = 100;
+        let start = std::time::Instant::now();
+
+        let (permit_a, wait_a) = acquire_gate(&gate).await;
+        assert_eq!(wait_a, 0);
+
+        let b = async {
+            let (permit_b, wait_b) = acquire_gate(&gate).await;
+            assert!(wait_b > 0, "b must have waited for a to release");
+            tokio::time::sleep(std::time::Duration::from_millis(HOLD_MS)).await;
+            drop(permit_b);
+        };
+        let c = async {
+            let (permit_c, wait_c) = acquire_gate(&gate).await;
+            // c must wait for both a's hold and b's hold, since only one
+            // permit exists - roughly 2x HOLD_MS, not just b's alone.
+            assert!(wait_c >= (HOLD_MS * 2).saturating_sub(60), "expected c to wait for both a and b (~{}ms), actually waited {wait_c}ms", HOLD_MS * 2);
+            drop(permit_c);
+        };
+        let release_a = async {
+            tokio::time::sleep(std::time::Duration::from_millis(HOLD_MS)).await;
+            drop(permit_a);
+        };
+        tokio::join!(b, c, release_a);
+
+        let total = start.elapsed().as_millis() as u64;
+        assert!(total >= (HOLD_MS * 2).saturating_sub(60), "three sequential holds of {HOLD_MS}ms each should take at least ~{}ms total, took {total}ms", HOLD_MS * 2);
     }
 }

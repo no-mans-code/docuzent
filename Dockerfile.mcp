@@ -1,0 +1,67 @@
+# Rust-only build - no Python, no Docling, no torch. For running
+# docuzent-mcp (or docuzent-cli's --text-only path) standalone, for users
+# who only need the MCP server (#28) for coding-agent use - source code
+# and plain text via `text_only: true`, which never calls Docling at all
+# (#27). The main Dockerfile bundles a full Python/Docling/torch runtime
+# because docuzent-web needs real document parsing; that weight is
+# unnecessary if all you want is the MCP server. See
+# https://github.com/no-mans-code/docuzent/issues/31.
+#
+# This image CANNOT ingest real documents (PDF/DOCX/scans/etc.) - that
+# path is Docling-only, and Docling isn't in this image at all. Use the
+# main Dockerfile/docuzent-web for that.
+
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /app
+
+# redb (via kvcache) and a couple of transitive deps need a C toolchain;
+# git is needed for the git dependencies (kvcache, ollama-kv-profiler).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config build-essential git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY docuzent-core ./docuzent-core
+COPY docuzent-cli ./docuzent-cli
+COPY docuzent-mcp ./docuzent-mcp
+# The workspace manifest lists docuzent-web too - Cargo needs its
+# Cargo.toml present to resolve the workspace at all, even though `-p`
+# below means its own (much heavier) dependency tree is never actually
+# compiled into this image.
+COPY docuzent-web/Cargo.toml ./docuzent-web/Cargo.toml
+RUN mkdir -p docuzent-web/src && echo "fn main() {}" > docuzent-web/src/main.rs
+
+# Only the two Rust-only binaries - docuzent-web itself is deliberately
+# excluded from this build (it's the one that needs Docling).
+RUN cargo build --release -p docuzent-mcp -p docuzent-cli
+
+FROM debian:bookworm-slim AS runtime
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/docuzent-mcp /usr/local/bin/docuzent-mcp
+COPY --from=builder /app/target/release/docuzent /usr/local/bin/docuzent
+
+# On-disk caches (LLM-context + Docling parse, though the parse cache
+# stays empty in this image since nothing here ever calls Docling) -
+# mount this as a volume to survive container restarts.
+VOLUME ["/data"]
+
+ENV DOCUZENT_CACHE=/data/context.redb
+ENV DOCUZENT_DOCLING_CACHE=/data/docling.redb
+# host.docker.internal is Docker Desktop's own DNS name for the host
+# machine (Windows/Mac) - reaches a real `ollama serve` running on the
+# host, since "localhost" from inside the container means the container
+# itself. Override with -e DOCUZENT_HOST=... on Linux Docker (see the
+# main docker-compose.yml's extra_hosts for making the same name resolve
+# there too, if preferred over a direct IP).
+ENV DOCUZENT_HOST=http://host.docker.internal:11434
+ENV DOCUZENT_MODEL=qwen2.5:3b
+
+# MCP is stdio-transport, not a network service - no EXPOSE, and this
+# must be run with `-i` (interactive) so stdin/stdout stay attached for
+# the JSON-RPC framing. See the README's "MCP server" section for the
+# full `docker run` / `assistant mcp add` command.
+ENTRYPOINT ["docuzent-mcp"]

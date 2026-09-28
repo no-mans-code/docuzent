@@ -46,7 +46,9 @@ Requires a running local Ollama (`ollama serve`) with the chosen model pulled, a
 | Feature | Description |
 |---------|-------------|
 | **Local ingestion** | Any format Docling parses - PDF, DOCX, Markdown, plain text, images (OCR), audio/video (ASR) - or a `.zip` of them, extracted one level deep. |
-| **Model size inference** | Queries Ollama's `/api/show` for the real context window of whichever model you pick - no manual sizing. |
+| **VRAM-aware context sizing** | The default context length is capped by the model's real trained context (not just its RoPE-extrapolated nominal window) and real free VRAM (real GGUF architecture metadata, not guessed) - controllable via `--context-length` or the web UI's slider. See "VRAM-aware context sizing" below. |
+| **Text-only ingestion** | Plain text/source-code files skip Docling entirely via `--text-only` / `text_only: true` - reuses the same caching/chunking machinery, just a different front end. |
+| **MCP server** | `docuzent-mcp` exposes document Q&A as a tool for coding agents (coding agent, etc.) over stdio - see "MCP server" below. A Docling-free Docker image (`Dockerfile.mcp`, 149MB) is available for MCP-only use. |
 | **Fits-or-map-reduce** | A document that fits the model's context window is answered in one call; a bigger one is split and answered via question-aware map-reduce. |
 | **On-disk context cache** | `no-mans-code/kvcache` - a generic, size-bounded, LRU-evicted cache, keyed by `{model}|{context length}|{document hash}`. Tunable capacity, default `min(disk/2, 50GB)`. Loading a genuinely different document set evicts the previous one's entry immediately, not left to LRU aging. |
 | **Docling parse cache** | A second, separate on-disk cache (10GB default) for Docling's own parsing output, keyed per source file - independent of model or mode, since parsing is the same work regardless of what's later done with the text. |
@@ -139,14 +141,61 @@ cargo build --release -p docuzent-mcp
 assistant mcp add --transport stdio docuzent -- ./target/release/docuzent-mcp
 ```
 
-Configured via environment variables (an MCP client launches the server directly, with no natural place for CLI flags): `DOCUZENT_MODEL` (default `qwen2.5:3b`), `DOCUZENT_HOST` (default `http://localhost:11434`), `DOCUZENT_CACHE`/`DOCUZENT_DOCLING_CACHE` (default under `.docuzent-cache/`), `DOCUZENT_MAP_REDUCE_CONTEXT_FRACTION`.
+Configured via environment variables (an MCP client launches the server directly, with no natural place for CLI flags): `DOCUZENT_MODEL` (default `qwen2.5:3b`), `DOCUZENT_HOST` (default `http://localhost:11434`), `DOCUZENT_CACHE`/`DOCUZENT_DOCLING_CACHE` (default under `.docuzent-cache/`), `DOCUZENT_MAP_REDUCE_CONTEXT_FRACTION`, `DOCUZENT_CONTEXT_LENGTH` (override the VRAM-aware safe default - see "VRAM-aware context sizing" below), `DOCUZENT_MAX_CONCURRENT_REQUESTS` (default `1` - see "Concurrent requests" below).
 
 The one tool, **`ask_document(paths: string[], question: string, text_only?: bool)`**:
 - `paths` - one or more files (or `.zip`s of them) loaded as a single combined corpus.
 - `question` - must be real and specific; a bare `"summarize"` or an empty string is rejected outright, since an unfocused ask defeats question-aware map-reduce chunking and risks silently dropping whatever detail the caller actually needed.
 - `text_only` - skip Docling for plain-text/source files (see above); needed before code files can go through this server sensibly.
 
-The response reports `cache_tier` - `"cold"`, `"adaptive-reuse"`, or `"adaptive-reuse-partial (n/m chunks)"` for a map-reduced document - so the calling agent can see the real cost characteristics rather than guessing from latency. Verified for real: a fresh ~67KB text file's first question comes back `"cold"`; the exact same file, in a brand-new server process, on its next question comes back `"adaptive-reuse"` - genuine cross-process disk-cache reuse, not a cosmetic label. See [issue #28](https://github.com/no-mans-code/docuzent/issues/28).
+The response reports:
+- `cache_tier` - `"cold"`, `"adaptive-reuse"`, or `"adaptive-reuse-partial (n/m chunks)"` for a map-reduced document - so the calling agent can see the real cost characteristics rather than guessing from latency. Verified for real: a fresh ~67KB text file's first question comes back `"cold"`; the exact same file, in a brand-new server process, on its next question comes back `"adaptive-reuse"` - genuine cross-process disk-cache reuse, not a cosmetic label. See [issue #28](https://github.com/no-mans-code/docuzent/issues/28).
+- `ram_offload_warning` - ground truth from Ollama's own `/api/ps`, present only when the model is measurably spilling into system RAM (see "VRAM-aware context sizing" below).
+- `queued_ms` - how long this specific call actually waited for a free slot behind other in-flight calls (see "Concurrent requests" below).
+
+### A Docling-free image, for MCP-only use
+
+`Dockerfile.mcp` builds `docuzent-mcp` (and `docuzent-cli`) with **no Python, no Docling, no torch at all** - just the Rust workspace. Real, measured: 149MB and a ~32s build, vs. the main `Dockerfile`'s multi-GB Python/torch runtime. It cannot ingest real documents (PDF/DOCX/scans - that's Docling-only), but everything through `text_only: true` works identically, since that path never touches Docling. For an agent that only ever asks about source code or plain text, this is the image to use.
+
+```bash
+docker build -f Dockerfile.mcp -t docuzent-mcp .
+docker run -i --rm -v docuzent-mcp-cache:/data -e DOCUZENT_MODEL=qwen2.5:3b docuzent-mcp
+# wire into an MCP client, e.g.:
+assistant mcp add --transport stdio docuzent -- docker run -i --rm -v docuzent-mcp-cache:/data docuzent-mcp
+```
+
+`host.docker.internal` (Docker Desktop's DNS name for the host machine) is the default `DOCUZENT_HOST`, matching the main `Dockerfile`'s convention - override with `-e DOCUZENT_HOST=...` on Linux Docker. Verified for real: built the image, ran it against a mounted file and the host's real Ollama, got a correct answer with `chars_loaded` matching the raw file exactly. See [issue #31](https://github.com/no-mans-code/docuzent/issues/31).
+
+---
+
+## VRAM-aware context sizing (`docuzent_core::vram`)
+
+The default context length is no longer just "whatever `/api/show` reports as the model's nominal window" - that number can be actively unsafe to use as-is, for two independent reasons this module accounts for:
+
+1. **RoPE-scaling extrapolation.** `devstral-small-2:24b` reports a nominal 393,216-token context, but its own metadata (`mistral3.rope.scaling.original_context_length`) shows it was actually trained on 8,192 - the rest is extrapolation. Trusting the nominal number crashed Ollama outright in earlier testing (see the map-reduce section above). The safe default is now capped at the model's real trained context when one is reported.
+2. **VRAM.** Real KV-cache size is computed from the model's actual GGUF architecture metadata - `block_count`, `attention.head_count_kv`, and, since it matters, `attention.key_length` directly rather than the derived `embedding_length / head_count` approximation (`ollama_kv_profiler::ollama::Client::architecture_info` falls back to that approximation, and it's a measurable **25% underestimate for devstral/mistral3** - real 128 vs. derived 160 - and a **2.9x underestimate for gemma4** - real 512 vs. derived 176; `docuzent_core::model_info::ModelInfo::attention_key_length` reads the real field directly when the model reports it). Combined with the model's real on-disk weight size and real free VRAM (`nvidia-smi`, NVIDIA-only for now), the default context length is capped to whatever actually fits within 85% of free VRAM.
+
+Real, live result on this project's own dev machine (an RTX 5080, 16GB): `devstral-small-2:24b`'s ~15.2GB of weights alone exceed the safety-margin budget at the time of testing - the safe default correctly floors at 4,096 tokens (map-reduce then handles anything larger) rather than claiming the model's real 8,192-token trained context is safe when, on this exact card, it measurably wasn't. This matches the earlier, separately-documented finding that a 24B model on a 16GB card spills into system RAM even at a "realistic" context size.
+
+**Ground truth, not just prediction**: after a real call, `docuzent_core::vram::real_vram_fraction` reads Ollama's own `/api/ps` for the fraction of the model actually resident in VRAM right now - surfaced as `ram_offload_warning` in `docuzent-web`'s `/model-info`/`/ask` responses and `docuzent-mcp`'s `ask_document` response whenever a model is measurably spilling to system RAM. An explicit override (`--context-length` / the web UI's slider / `DOCUZENT_CONTEXT_LENGTH`) always bypasses every check here - this only changes what happens with no override given. See [issue #30](https://github.com/no-mans-code/docuzent/issues/30).
+
+### Context-size slider (web UI)
+
+The context-size field in the web UI is a slider, not a fixed number - bounded by the model's real nominal window, defaulting to the safe value above, with a live red/green estimate (using the exact same formula the backend uses, via `GET /context-estimate?model=...`) as it's dragged: model weight size + KV-cache-at-this-size + a fixed overhead margin, compared against real free VRAM. Dragging it past the safe boundary shows the real estimated GB and turns the slider red before you even click Apply. See [issue #29](https://github.com/no-mans-code/docuzent/issues/29).
+
+### Ingestion progress: a real estimate, honestly labeled
+
+Ollama's API exposes no live prefill-progress signal - there is no partial-progress event during prompt evaluation. `GET /progress` (polled by the web UI while `/ask` is in flight) computes an *estimate*: `elapsed time × this session's own real measured prefill_tokens_per_sec` (from `docuzent_core::speed_profile::SpeedProfile` - real wall-clock timing from prior calls, so it already reflects any real slowdown from RAM offload, not a theoretical rate), clamped to the document's estimated total token count. The first-ever call for a `(model, context length)` pair has no measured rate yet - the UI shows an explicit indeterminate state then, never a fabricated number.
+
+---
+
+## Concurrent requests: explicit, fair, and observable (not yet parallel)
+
+Traced directly from the code: `docuzent-web` and `docuzent-mcp` each hold exactly one active `Session` (one document, one model) behind a lock - by design, since loading a new document evicts the previous one. Before this, concurrent requests just contended for that lock with no fairness guarantee, no configurable limit, and no visibility into how long a request actually waited.
+
+Now: a `tokio::sync::Semaphore`-based admission gate (`--max-concurrent-requests` / `DOCUZENT_MAX_CONCURRENT_REQUESTS`, default `1`) makes this explicit and FIFO-fair, and every response reports real, measured `queued_ms` - how long *this* request waited, not a guess. Real, verified: two overlapping `ask_document` calls against the same MCP server showed one return with `queued_ms: 0` and the other with `queued_ms: 7203` - a genuine multi-second wait behind the first call's real Ollama round trip, not a fabricated number.
+
+**This does not add real parallelism** - raising the limit above 1 without a real multi-session pool just means concurrent callers stomp on the same document (repeated cache-eviction thrashing from `Session::load_documents`'s "evict the previous document" behavior), so the default stays 1. A real multi-session pool - admission-controlled by the VRAM estimator above, so as many models as actually fit in free VRAM run truly in parallel - is designed but not yet built; not pub/sub (that's a fan-out pattern, not a request/response admission-control one) but a bounded worker pool behind this same fair queue. See [issue #32](https://github.com/no-mans-code/docuzent/issues/32).
 
 ---
 
