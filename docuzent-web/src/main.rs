@@ -123,7 +123,14 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", cli.port);
+    // 0.0.0.0, not 127.0.0.1 - loopback-only is invisible to Docker's
+    // port forwarding (it connects to the container's external-facing
+    // interface, not its loopback), which would otherwise accept the
+    // container and the port mapping while every real request got an
+    // empty reply. Binding all interfaces is the standard, safe choice
+    // for a server that may run in a container - it doesn't change
+    // anything about direct localhost access when run natively.
+    let addr = format!("0.0.0.0:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("failed to bind {addr}"))?;
     println!("Listening on http://localhost:{}", cli.port);
     axum::serve(listener, app).await?;
