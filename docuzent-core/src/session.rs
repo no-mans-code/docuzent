@@ -56,8 +56,11 @@ use crate::speed_profile::SpeedProfile;
 const OVERHEAD_FRACTION: f32 = 0.2;
 /// Rough chars-per-token estimate for English prose - good enough for a
 /// sizing decision, not for exact token accounting (Ollama's API does not
-/// expose a tokenizer endpoint to do better without bundling one).
-const CHARS_PER_TOKEN: usize = 4;
+/// expose a tokenizer endpoint to do better without bundling one). Public
+/// so a front-end can make the same estimate for an ingestion-progress
+/// display (see `Session::estimated_prefill_tokens_per_sec`) without
+/// duplicating the number.
+pub const CHARS_PER_TOKEN: usize = 4;
 /// Starting point for how much of a model's *nominal* context window a
 /// single map-reduce chunk should actually use - filling a window to its
 /// advertised limit is a real, separate question from whether the model
@@ -216,6 +219,27 @@ impl<G: Generator> Session<G> {
 
     fn cache_key(&self, doc_hash: &str) -> String {
         format!("{}|{}|{doc_hash}", self.model, self.context_length)
+    }
+
+    /// The real, measured tokens/sec this session's `(model, context_length)`
+    /// has actually primed at, if any real ingest has happened yet -
+    /// `None` before the first one (nothing measured, so nothing to
+    /// estimate from). A front-end can multiply this by elapsed wall time
+    /// to show an *estimated* ingestion-progress figure - real,
+    /// measured-throughput-derived, not fabricated, and naturally already
+    /// reflects any real slowdown (e.g. RAM offload) since it comes from
+    /// actual wall-clock timing rather than a theoretical rate. See
+    /// https://github.com/no-mans-code/docuzent/issues/30.
+    pub fn estimated_prefill_tokens_per_sec(&self) -> Option<f64> {
+        self.speed_profile.as_ref().map(|p| p.prefill_tokens_per_sec)
+    }
+
+    /// Character count of whichever document is currently loaded, if any -
+    /// for a front-end to derive an estimated total token count for an
+    /// ingestion-progress display without needing its own copy of the
+    /// text. `None` when nothing is loaded.
+    pub fn current_text_len_chars(&self) -> Option<usize> {
+        self.current.as_ref().map(|c| c.text.chars().count())
     }
 
     fn save_speed_profile(&self) -> Result<()> {

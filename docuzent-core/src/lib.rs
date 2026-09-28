@@ -10,3 +10,4 @@ pub mod pipeline;
 pub mod session;
 pub mod speed_profile;
 pub mod store;
+pub mod vram;

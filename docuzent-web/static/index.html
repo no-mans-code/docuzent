@@ -300,6 +300,102 @@
     margin-right: 6px;
   }
 
+  /* Context-size slider + its live VRAM estimate bar */
+  .ctx-row { margin-top: 14px; }
+  .ctx-label-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .ctx-value {
+    font-size: 0.82rem;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  input[type="range"] {
+    width: 100%;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.1);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 0 0 4px rgba(109, 141, 255, 0.18);
+    transition: background 0.2s ease;
+  }
+  input[type="range"].vram-over::-webkit-slider-thumb { background: var(--error); box-shadow: 0 0 0 4px rgba(255, 122, 122, 0.2); }
+  input[type="range"]::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+  }
+  input[type="range"].vram-over::-moz-range-thumb { background: var(--error); }
+  .vram-estimate {
+    margin-top: 8px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  }
+  .vram-estimate.over {
+    color: var(--error);
+    background: rgba(255, 122, 122, 0.08);
+    border-color: rgba(255, 122, 122, 0.35);
+  }
+
+  /* Persistent, real (not estimated) RAM-offload ground-truth badge */
+  .ram-offload-badge {
+    display: none;
+    margin-top: 10px;
+    font-size: 0.8rem;
+    color: var(--error);
+    background: rgba(255, 122, 122, 0.1);
+    border: 1px solid rgba(255, 122, 122, 0.35);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .ram-offload-badge.visible { display: block; }
+
+  /* Ingestion token progress - an *estimate*, always labeled as one */
+  .token-progress {
+    display: none;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .token-progress.visible { display: block; }
+  .token-progress-track {
+    position: relative;
+    height: 5px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.07);
+    overflow: hidden;
+    margin-top: 5px;
+  }
+  .token-progress-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent-2), var(--accent));
+    transition: width 0.3s ease;
+  }
+
   footer {
     color: var(--muted);
     font-size: 0.76rem;
@@ -333,7 +429,16 @@
         <button id="switchBtn">Apply</button>
       </div>
     </div>
+    <div class="ctx-row">
+      <div class="ctx-label-row">
+        <label for="contextSlider" style="margin-bottom: 0;">Context size</label>
+        <span class="ctx-value" id="contextValue">—</span>
+      </div>
+      <input type="range" id="contextSlider" min="1024" max="4096" value="4096" step="256">
+      <div class="vram-estimate" id="vramEstimate">Pick a model to see its real context window and VRAM estimate.</div>
+    </div>
     <div class="status" id="switchStatus"></div>
+    <div class="ram-offload-badge" id="ramOffloadBadge"></div>
   </section>
 
   <section class="panel">
@@ -341,6 +446,10 @@
       <input type="file" id="fileInput" accept="*/*" multiple>
       <button id="loadBtn">Load document(s)</button>
     </div>
+    <label style="display: flex; align-items: center; gap: 6px; margin-top: 10px; text-transform: none; letter-spacing: normal; cursor: pointer;">
+      <input type="checkbox" id="textOnlyCheckbox" style="margin: 0;">
+      Plain text / source code (skip Docling)
+    </label>
     <div class="status" id="loadStatus"></div>
     <div class="progress" id="loadProgress">
       <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
@@ -359,6 +468,10 @@
       <button id="askBtn">Ask</button>
     </div>
     <div class="status" id="askStatus"></div>
+    <div class="token-progress" id="tokenProgress">
+      <span id="tokenProgressLabel"></span>
+      <div class="token-progress-track"><div class="token-progress-fill" id="tokenProgressFill"></div></div>
+    </div>
     <div class="transcript" id="transcript"></div>
   </section>
 
@@ -368,6 +481,7 @@
 <script>
 const loadBtn = document.getElementById('loadBtn');
 const fileInput = document.getElementById('fileInput');
+const textOnlyCheckbox = document.getElementById('textOnlyCheckbox');
 const loadStatus = document.getElementById('loadStatus');
 const loadProgress = document.getElementById('loadProgress');
 const progressFill = document.getElementById('progressFill');
@@ -381,11 +495,108 @@ const modelSelect = document.getElementById('modelSelect');
 const modeSelect = document.getElementById('modeSelect');
 const switchBtn = document.getElementById('switchBtn');
 const switchStatus = document.getElementById('switchStatus');
+const contextSlider = document.getElementById('contextSlider');
+const contextValue = document.getElementById('contextValue');
+const vramEstimate = document.getElementById('vramEstimate');
+const ramOffloadBadge = document.getElementById('ramOffloadBadge');
+const tokenProgress = document.getElementById('tokenProgress');
+const tokenProgressLabel = document.getElementById('tokenProgressLabel');
+const tokenProgressFill = document.getElementById('tokenProgressFill');
 
 function setStatus(el, text, kind) {
   el.textContent = text;
   el.classList.toggle('error', kind === 'error');
   el.classList.toggle('ok', kind === 'ok');
+}
+
+function formatGB(bytes) {
+  return (bytes / 1e9).toFixed(1);
+}
+
+// The context-size slider's real bounds/estimate for whichever model is
+// currently selected in the dropdown - independent of whichever model
+// the *active session* happens to be using, so picking a different model
+// updates the slider before "Apply" is even clicked. See docuzent#29/#30.
+let currentVram = null;
+
+// Live, client-side estimate using the exact same formula the backend
+// uses to pick a safe default (weight_bytes + kv_bytes_per_token * tokens
+// + overhead_bytes), so the slider's red/green state always agrees with
+// what the backend would actually do at that value - no guessing at a
+// second copy of the formula.
+function renderVramEstimate() {
+  if (!currentVram) {
+    vramEstimate.textContent = 'Pick a model to see its real context window and VRAM estimate.';
+    vramEstimate.classList.remove('over');
+    contextSlider.classList.remove('vram-over');
+    return;
+  }
+  const tokens = parseInt(contextSlider.value, 10);
+  contextValue.textContent = `${tokens.toLocaleString()} tokens`;
+
+  const estimatedBytes = currentVram.weight_bytes + currentVram.kv_bytes_per_token * tokens + currentVram.overhead_bytes;
+  const trainedCeiling = currentVram.original_context_length || currentVram.nominal_context_length;
+  const lines = [`~${formatGB(estimatedBytes)} GB estimated VRAM at this size (model ~${formatGB(currentVram.weight_bytes)} GB + KV cache)`];
+
+  if (currentVram.original_context_length && currentVram.original_context_length !== currentVram.nominal_context_length) {
+    lines.push(`nominal window (${currentVram.nominal_context_length.toLocaleString()}) is RoPE-extrapolated - really trained on ${currentVram.original_context_length.toLocaleString()}`);
+  }
+
+  let over = false;
+  if (currentVram.vram_free_bytes != null) {
+    const budget = currentVram.vram_free_bytes * currentVram.safety_fraction;
+    over = estimatedBytes > budget;
+    lines.push(
+      over
+        ? `RAM OFFLOAD LIKELY: exceeds the safe VRAM budget (~${formatGB(budget)} GB of ~${formatGB(currentVram.vram_free_bytes)} GB free) - will run slower, spilling to system RAM`
+        : `fits within free VRAM (~${formatGB(currentVram.vram_free_bytes)} GB free)`
+    );
+  } else {
+    lines.push('free VRAM could not be measured (no NVIDIA GPU detected)');
+  }
+  if (tokens > trainedCeiling) {
+    lines.push(`above the model's real trained context (${trainedCeiling.toLocaleString()}) - answer quality may degrade even if it fits in VRAM`);
+  }
+  if (tokens < currentVram.nominal_context_length) {
+    lines.push('a document larger than this will automatically use map-reduce');
+  }
+
+  vramEstimate.textContent = lines.join(' · ');
+  vramEstimate.classList.toggle('over', over);
+  contextSlider.classList.toggle('vram-over', over);
+}
+
+async function fetchContextEstimateFor(model) {
+  if (!model) return;
+  try {
+    const resp = await fetch(`/context-estimate?model=${encodeURIComponent(model)}`);
+    const data = await resp.json();
+    if (!data.ok) {
+      currentVram = null;
+      vramEstimate.textContent = data.error || 'Could not estimate VRAM for this model.';
+      vramEstimate.classList.add('over');
+      return;
+    }
+    currentVram = data.vram;
+    contextSlider.min = 1024;
+    contextSlider.max = currentVram.nominal_context_length;
+    contextSlider.step = Math.max(256, Math.round(currentVram.nominal_context_length / 200));
+    contextSlider.value = currentVram.safe_context_length;
+    renderVramEstimate();
+  } catch (e) {
+    currentVram = null;
+    vramEstimate.textContent = 'Request failed: ' + e;
+    vramEstimate.classList.add('over');
+  }
+}
+
+function showRamOffloadBadge(warning) {
+  if (warning) {
+    ramOffloadBadge.textContent = warning;
+    ramOffloadBadge.classList.add('visible');
+  } else {
+    ramOffloadBadge.classList.remove('visible');
+  }
 }
 
 // The backend answers /load in one shot (see docuzent#22 for real
@@ -453,6 +664,9 @@ async function loadDocument() {
   for (const file of files) {
     form.append('file', file, file.name);
   }
+  if (textOnlyCheckbox.checked) {
+    form.append('text_only', 'true');
+  }
 
   try {
     const resp = await fetch('/load', { method: 'POST', body: form });
@@ -479,6 +693,41 @@ async function loadDocument() {
   }
 }
 
+// Ollama's API exposes no live prefill-progress signal - this polls the
+// backend's own *estimate* (elapsed time × this session's real measured
+// throughput, see docuzent-web's /progress handler) while an /ask request
+// that might be doing a slow cold prime is in flight. Always labeled as
+// an estimate; shown as indeterminate when there's no measured rate yet
+// (a first-ever call for this model/context length) rather than a
+// fabricated number.
+let progressPoll = null;
+
+function startTokenProgressPolling() {
+  tokenProgress.classList.add('visible');
+  tokenProgressLabel.textContent = 'Checking…';
+  tokenProgressFill.style.width = '0%';
+  progressPoll = setInterval(async () => {
+    try {
+      const resp = await fetch('/progress');
+      const p = await resp.json();
+      if (!p.active) return;
+      if (p.tokens_per_sec > 0) {
+        const pct = p.estimated_tokens_total > 0 ? Math.min(100, (p.estimated_tokens_done / p.estimated_tokens_total) * 100) : 0;
+        tokenProgressFill.style.width = `${pct}%`;
+        tokenProgressLabel.textContent = `~${p.estimated_tokens_done.toLocaleString()} / ~${p.estimated_tokens_total.toLocaleString()} tokens ingested (estimated)`;
+      } else {
+        tokenProgressFill.style.width = '15%';
+        tokenProgressLabel.textContent = `${p.label || 'working'}… (no timing data yet to estimate progress)`;
+      }
+    } catch (e) { /* transient - next tick will retry */ }
+  }, 400);
+}
+
+function stopTokenProgressPolling() {
+  if (progressPoll) { clearInterval(progressPoll); progressPoll = null; }
+  tokenProgress.classList.remove('visible');
+}
+
 async function askQuestion() {
   const question = questionInput.value.trim();
   if (!question) return;
@@ -486,6 +735,7 @@ async function askQuestion() {
   questionInput.disabled = true;
   setStatus(askStatus, '', null);
   askStatus.innerHTML = '<span class="badge">thinking</span>working through the document…';
+  startTokenProgressPolling();
 
   try {
     const resp = await fetch('/ask', {
@@ -494,11 +744,13 @@ async function askQuestion() {
       body: JSON.stringify({ question }),
     });
     const data = await resp.json();
+    stopTokenProgressPolling();
     if (!data.ok) {
       setStatus(askStatus, data.error || 'Failed to answer.', 'error');
       return;
     }
     setStatus(askStatus, '', null);
+    showRamOffloadBadge(data.ram_offload_warning);
     const turn = document.createElement('div');
     turn.className = 'turn';
     const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(' · ');
@@ -514,6 +766,7 @@ async function askQuestion() {
     transcript.prepend(turn);
     questionInput.value = '';
   } catch (e) {
+    stopTokenProgressPolling();
     setStatus(askStatus, 'Request failed: ' + e, 'error');
   } finally {
     askBtn.disabled = false;
@@ -539,6 +792,15 @@ async function refreshModelInfo() {
     modelInfo.textContent = `model: ${d.model} · mode: ${d.mode} · context window: ${d.context_length.toLocaleString()} tokens · cache: ${d.cache_path}`;
     modelSelect.value = d.model;
     modeSelect.value = d.mode;
+    showRamOffloadBadge(d.ram_offload_warning);
+    if (d.vram) {
+      currentVram = d.vram;
+      contextSlider.min = 1024;
+      contextSlider.max = currentVram.nominal_context_length;
+      contextSlider.step = Math.max(256, Math.round(currentVram.nominal_context_length / 200));
+      contextSlider.value = d.context_length;
+      renderVramEstimate();
+    }
   } catch (e) {
     modelInfo.textContent = 'model info unavailable: ' + e;
   }
@@ -567,6 +829,7 @@ async function loadModelList() {
 async function switchModel() {
   const model = modelSelect.value;
   const mode = modeSelect.value;
+  const context_length = parseInt(contextSlider.value, 10);
   if (!model) {
     setStatus(switchStatus, 'Choose a model first.', 'error');
     return;
@@ -577,7 +840,7 @@ async function switchModel() {
     const resp = await fetch('/model', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, mode }),
+      body: JSON.stringify({ model, mode, context_length }),
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -601,6 +864,8 @@ loadBtn.addEventListener('click', loadDocument);
 askBtn.addEventListener('click', askQuestion);
 switchBtn.addEventListener('click', switchModel);
 questionInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') askQuestion(); });
+contextSlider.addEventListener('input', renderVramEstimate);
+modelSelect.addEventListener('change', () => fetchContextEstimateFor(modelSelect.value));
 
 loadModelList().then(refreshModelInfo);
 </script>

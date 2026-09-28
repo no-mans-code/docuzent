@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
-use docuzent_core::session::{infer_context_length, Mode, Session, DEFAULT_MAP_REDUCE_CONTEXT_FRACTION};
+use docuzent_core::session::{Mode, Session, DEFAULT_MAP_REDUCE_CONTEXT_FRACTION};
 use kvcache::Cache;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -74,16 +74,45 @@ struct AskDocumentResponse {
     used_map_reduce: bool,
     chunks_mapped: usize,
     chars_loaded: usize,
+    /// Ground truth from Ollama's own `/api/ps` (not an estimate): the
+    /// fraction of the model currently sitting in VRAM, taken right after
+    /// this call. `None` when it can't be measured (no NVIDIA GPU). Below
+    /// ~0.98, the model is being partly served from system RAM - real,
+    /// measured evidence of the slowdown this causes, not a guess. See
+    /// https://github.com/no-mans-code/docuzent/issues/30.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_offload_warning: Option<String>,
+    /// Real, measured milliseconds this call waited for a free slot
+    /// behind `DOCUZENT_MAX_CONCURRENT_REQUESTS` other in-flight calls -
+    /// `0` when uncontended. See
+    /// https://github.com/no-mans-code/docuzent/issues/32.
+    queued_ms: u64,
 }
 
 #[derive(Clone)]
 struct DocuzentTools {
     session: Arc<Mutex<Session<OllamaClient>>>,
+    host: String,
+    model: String,
+    /// Fair (FIFO), explicit admission gate - see
+    /// `DOCUZENT_MAX_CONCURRENT_REQUESTS` and
+    /// https://github.com/no-mans-code/docuzent/issues/32. There is
+    /// exactly one active document/model at a time by design (`session`
+    /// above is one `Session`), so this defaults to 1 permit: it exists
+    /// to make today's serialization fair and observable (real
+    /// `queued_ms` per call), not to add real parallelism, which would
+    /// need a real multi-session pool (tracked, not built yet).
+    request_gate: Arc<tokio::sync::Semaphore>,
     // Read by #[tool_router]'s generated dispatch code, not by name in
     // this file - matches the upstream rmcp examples' own convention.
     #[allow(dead_code)]
     tool_router: ToolRouter<DocuzentTools>,
 }
+
+/// Below this fraction resident in VRAM, worth surfacing as a real,
+/// measured warning rather than staying silent - small numerical slop
+/// under 1.0 from measurement rounding shouldn't itself count as offload.
+const RAM_OFFLOAD_WARNING_THRESHOLD: f64 = 0.97;
 
 /// Rejects an empty or too-generic question. See [`MIN_QUESTION_WORDS`].
 fn validate_question(question: &str) -> Result<(), String> {
@@ -104,13 +133,17 @@ impl DocuzentTools {
     #[tool(
         description = "Answer one specific, focused question about one or more local documents (PDFs/Office formats/etc. via Docling, plain-text or source code via text_only, or .zip archives) without pulling the document's full contents into your own context - only the answer text is returned. Requires a real, specific question (not a bare \"summarize\") - see the paths/question/text_only argument docs. A second question about the same document set is typically far cheaper than the first: this server keeps an on-disk, per-document Ollama context cache and reuses it when that's predicted to be faster (see cache_tier in the response) instead of reprocessing the document from scratch every time."
     )]
-    fn ask_document(&self, Parameters(req): Parameters<AskDocumentRequest>) -> Result<CallToolResult, McpError> {
+    async fn ask_document(&self, Parameters(req): Parameters<AskDocumentRequest>) -> Result<CallToolResult, McpError> {
         if req.paths.is_empty() {
             return Ok(CallToolResult::error(vec![ContentBlock::text("`paths` must contain at least one file.")]));
         }
         if let Err(msg) = validate_question(&req.question) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]));
         }
+
+        let queue_start = std::time::Instant::now();
+        let _permit = self.request_gate.acquire().await.expect("request_gate semaphore is never closed");
+        let queued_ms = queue_start.elapsed().as_millis() as u64;
 
         let paths: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
         let mut session = self.session.lock().expect("session mutex poisoned by a prior panic");
@@ -126,6 +159,16 @@ impl DocuzentTools {
             Err(e) => return Ok(CallToolResult::error(vec![ContentBlock::text(format!("failed to answer: {e:#}"))])),
         };
         drop(session);
+
+        let ram_offload_warning = docuzent_core::vram::real_vram_fraction(&self.host, &self.model).and_then(|fraction| {
+            (fraction < RAM_OFFLOAD_WARNING_THRESHOLD).then(|| {
+                format!(
+                    "RAM OFFLOAD: only {:.0}% of `{}` is resident in VRAM right now (measured via Ollama's /api/ps) - the rest is running from system RAM, which is why this is slower than usual.",
+                    fraction * 100.0,
+                    self.model
+                )
+            })
+        });
 
         let cache_tier = if report.used_map_reduce {
             let total = report.chunk_adaptive_decisions.len();
@@ -149,6 +192,8 @@ impl DocuzentTools {
             used_map_reduce: report.used_map_reduce,
             chunks_mapped: report.chunks_mapped,
             chars_loaded: load.chars,
+            ram_offload_warning,
+            queued_ms,
         };
         let text = serde_json::to_string_pretty(&response)
             .map_err(|e| McpError::internal_error(format!("failed to serialize response: {e}"), None))?;
@@ -187,11 +232,37 @@ async fn main() -> Result<()> {
         env_or("DOCUZENT_MAP_REDUCE_CONTEXT_FRACTION", &DEFAULT_MAP_REDUCE_CONTEXT_FRACTION.to_string())
             .parse()
             .context("DOCUZENT_MAP_REDUCE_CONTEXT_FRACTION must be a number")?;
+    // Defaults to 1: exactly one document/model is active at a time by
+    // design (one `Session`), so raising this without a real multi-
+    // session pool (tracked, not built yet - see
+    // https://github.com/no-mans-code/docuzent/issues/32) just means
+    // concurrent tool calls stomp on the same document. The gate exists
+    // to make today's serialization fair (FIFO) and observable
+    // (`queued_ms` on every response), not to add real parallelism.
+    let max_concurrent_requests: usize = env_or("DOCUZENT_MAX_CONCURRENT_REQUESTS", "1")
+        .parse()
+        .context("DOCUZENT_MAX_CONCURRENT_REQUESTS must be a number")?;
 
     tracing::info!(%model, %host, "starting docuzent-mcp");
 
-    let context_length = infer_context_length(&host, &model)
-        .with_context(|| format!("failed to infer context size for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?;
+    let context_length_override: Option<u32> = match std::env::var("DOCUZENT_CONTEXT_LENGTH") {
+        Ok(v) => Some(v.parse().context("DOCUZENT_CONTEXT_LENGTH must be a number")?),
+        Err(_) => None,
+    };
+    // Defaults to a VRAM/trained-context-aware safe size rather than the
+    // model's raw nominal window - see docuzent_core::vram's module docs
+    // for the real, already-observed failure this prevents (a 24B model's
+    // RoPE-extrapolated nominal context crashing Ollama outright).
+    let (context_length, estimate) = docuzent_core::vram::resolve_context_length(&host, &model, context_length_override)
+        .with_context(|| format!("failed to size context window for `{model}` - is `ollama serve` running and has `{model}` been pulled?"))?;
+    tracing::info!(
+        context_length,
+        nominal_context_length = estimate.nominal_context_length,
+        original_context_length = estimate.original_context_length,
+        vram_free_bytes = estimate.vram_free_bytes,
+        overridden = context_length_override.is_some(),
+        "context window sized"
+    );
 
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -215,7 +286,13 @@ async fn main() -> Result<()> {
         docling_cache,
     )?;
 
-    let tools = DocuzentTools { session: Arc::new(Mutex::new(session)), tool_router: DocuzentTools::tool_router() };
+    let tools = DocuzentTools {
+        session: Arc::new(Mutex::new(session)),
+        host: host.clone(),
+        model: model.clone(),
+        request_gate: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests.max(1))),
+        tool_router: DocuzentTools::tool_router(),
+    };
 
     let service = tools.serve(stdio()).await.inspect_err(|e| {
         tracing::error!(?e, "serving error");
