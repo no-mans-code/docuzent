@@ -1,0 +1,8 @@
+target
+.venv
+.git
+.docuzent-cache
+temp-test
+temp-test-out
+out
+*.redb

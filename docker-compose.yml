@@ -1,0 +1,14 @@
+services:
+  docuzent-web:
+    build: .
+    ports:
+      - "3800:3800"
+    volumes:
+      - docuzent-cache:/data
+    # host.docker.internal already resolves on Docker Desktop (Windows/Mac)
+    # without this, but extra_hosts makes it work on Linux Docker too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  docuzent-cache:
