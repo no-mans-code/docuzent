@@ -18,6 +18,16 @@ pub trait Generator {
     fn generate(&self, prompt: &str, context: Option<&[i64]>) -> Result<GenerateResponse>;
 }
 
+/// Without an explicit cap, Ollama generates until a natural stop or the
+/// context fills - fine for a short factual answer, but a broad/
+/// open-ended question (e.g. "summarize every topic in this document")
+/// can legitimately run for minutes per call with no cap at all, times
+/// however many map-reduce chunks a big document needs (sequential, not
+/// parallel). This bounds a single call's worst case without silently
+/// truncating a real answer - generous enough for a genuine answer, not
+/// so large that one verbose chunk can dominate a whole map-reduce pass.
+const DEFAULT_NUM_PREDICT: i32 = 768;
+
 pub struct OllamaClient {
     host: String,
     model: String,
@@ -38,6 +48,7 @@ impl OllamaClient {
 #[derive(Serialize)]
 struct GenerateOptions {
     num_ctx: u32,
+    num_predict: i32,
 }
 
 #[derive(Serialize)]
@@ -73,7 +84,7 @@ pub struct GenerateResponse {
 impl Generator for OllamaClient {
     fn generate(&self, prompt: &str, context: Option<&[i64]>) -> Result<GenerateResponse> {
         let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
-        let req = GenerateRequest { model: &self.model, prompt, stream: false, context, options: GenerateOptions { num_ctx: self.num_ctx } };
+        let req = GenerateRequest { model: &self.model, prompt, stream: false, context, options: GenerateOptions { num_ctx: self.num_ctx, num_predict: DEFAULT_NUM_PREDICT } };
         let resp: GenerateResponse = ureq::post(&url)
             .send_json(req)
             .with_context(|| format!("ollama generate request to {url} failed - is `ollama serve` running?"))?

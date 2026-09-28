@@ -58,6 +58,15 @@ const OVERHEAD_FRACTION: f32 = 0.2;
 /// sizing decision, not for exact token accounting (Ollama's API does not
 /// expose a tokenizer endpoint to do better without bundling one).
 const CHARS_PER_TOKEN: usize = 4;
+/// Starting point for how much of a model's *nominal* context window a
+/// single map-reduce chunk should actually use - filling a window to its
+/// advertised limit is a real, separate question from whether the model
+/// still answers *correctly* at that size (a documented failure mode for
+/// many models: degraded recall on content in the middle/tail of a long
+/// context, sometimes well before the nominal limit). Not adopted on
+/// faith - see https://github.com/no-mans-code/docuzent/issues/24 for the
+/// real empirical check this needs and this number's provenance.
+pub const DEFAULT_MAP_REDUCE_CONTEXT_FRACTION: f32 = 0.25;
 /// One-time real disk-bandwidth measurement size, matching
 /// `ollama-kv-profiler`'s own usage.
 const DISK_BENCH_BYTES: usize = 256 * 1024 * 1024;
@@ -101,6 +110,9 @@ pub struct Session<G: Generator> {
     context_length: u32,
     work_dir: PathBuf,
     mode: Mode,
+    /// Fraction of `context_length` a single map-reduce chunk is sized to
+    /// use - see [`DEFAULT_MAP_REDUCE_CONTEXT_FRACTION`].
+    map_reduce_context_fraction: f32,
     disk_cache: Cache,
     docling_cache: DoclingCache,
     speed_profile: Option<SpeedProfile>,
@@ -123,11 +135,16 @@ pub struct AnswerReport {
     pub answer: String,
     pub used_map_reduce: bool,
     pub chunks_mapped: usize,
-    /// Set only in `Adaptive` mode, and only when a real decision was
-    /// made (a disk-cached context existed to choose between) - `None`
-    /// otherwise (`Swap`/`Raw` have nothing to decide; a first-ever
-    /// document has no disk context to weigh against).
+    /// Set only for the single-chunk path, in `Adaptive` mode, when a
+    /// real decision was made (a disk-cached context existed to choose
+    /// between) - `None` otherwise (`Swap`/`Raw` have nothing to decide;
+    /// a first-ever document has no disk context to weigh against).
     pub adaptive_decision: Option<AdaptiveDecision>,
+    /// The map-reduce path's equivalent - one entry per chunk that had a
+    /// real decision to make, in chunk order. Empty for the single-chunk
+    /// path (see `adaptive_decision` instead) or when no chunk had a
+    /// disk-cached context to weigh against yet.
+    pub chunk_adaptive_decisions: Vec<AdaptiveDecision>,
     pub timings: Vec<CallTiming>,
 }
 
@@ -154,6 +171,7 @@ impl<G: Generator> Session<G> {
         context_length: u32,
         work_dir: PathBuf,
         mode: Mode,
+        map_reduce_context_fraction: f32,
         disk_cache: Cache,
         docling_cache: DoclingCache,
     ) -> Result<Self> {
@@ -170,6 +188,7 @@ impl<G: Generator> Session<G> {
             context_length,
             work_dir,
             mode,
+            map_reduce_context_fraction,
             disk_cache,
             docling_cache,
             speed_profile,
@@ -181,6 +200,18 @@ impl<G: Generator> Session<G> {
     fn max_doc_chars(&self) -> usize {
         let usable_tokens = (self.context_length as f32 * (1.0 - OVERHEAD_FRACTION)) as usize;
         usable_tokens * CHARS_PER_TOKEN
+    }
+
+    /// How big a single map-reduce chunk is sized to be - a real,
+    /// explicit, configurable fraction of `context_length`
+    /// ([`Self::map_reduce_context_fraction`]), not implicitly derived
+    /// the same way [`Self::max_doc_chars`]'s "does the whole document
+    /// fit in one chunk" decision is. See
+    /// [`DEFAULT_MAP_REDUCE_CONTEXT_FRACTION`] for why this isn't just
+    /// the model's full nominal window.
+    fn max_map_reduce_chunk_chars(&self) -> usize {
+        let usable_tokens = (self.context_length as f32 * self.map_reduce_context_fraction) as usize;
+        usable_tokens.max(200) * CHARS_PER_TOKEN
     }
 
     fn cache_key(&self, doc_hash: &str) -> String {
@@ -255,6 +286,67 @@ impl<G: Generator> Session<G> {
             predicted_raw_ms: prediction.predicted_ingest_ms,
             chose_swap: predicted_swap_ms < prediction.predicted_ingest_ms,
         })
+    }
+
+    /// Establishes a primed context for `text` (keyed by `content_hash`),
+    /// honoring `self.mode` - shared by the single-chunk path (the whole
+    /// document) and each map-reduce chunk, so map-reduce really does
+    /// swap/raw/adaptive per chunk instead of silently skipping all reuse
+    /// (see issue #25). `existing_disk_context` is whatever the caller
+    /// already found on disk for this hash, if anything - passed in
+    /// rather than looked up here so a caller iterating many chunks in
+    /// `Mode::Raw` isn't forced to pay a disk lookup it'll ignore anyway.
+    ///
+    /// Only ever *writes* the primed state to disk - never a state that
+    /// reflects a specific follow-up question's answer. The caller
+    /// decides separately whether a later follow-up call's resulting
+    /// context should also be persisted: yes for the single-chunk
+    /// conversational path (a real back-and-forth benefits from
+    /// remembering earlier turns), never for map-reduce chunks, which
+    /// must stay question-independent so a different future question can
+    /// reuse the same chunk cleanly rather than inheriting whatever the
+    /// first question that touched it happened to be (the same
+    /// no-influence-from-previous-tokens principle this module already
+    /// applies to whole-document eviction - see
+    /// [`Session::evict_previous_if_different`]).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_context(
+        &mut self,
+        text: &str,
+        content_hash: &str,
+        prime_prompt: &str,
+        prime_label: &str,
+        follow_up_for_prediction: &str,
+        existing_disk_context: Option<Vec<i64>>,
+        timings: &mut Vec<CallTiming>,
+    ) -> Result<(Vec<i64>, Option<AdaptiveDecision>)> {
+        let disk_context = if self.mode == Mode::Raw { None } else { existing_disk_context };
+
+        let mut adaptive_decision = None;
+        let use_swap = match (self.mode, &disk_context) {
+            (Mode::Raw, _) => false,
+            (Mode::Swap, Some(_)) => true,
+            (Mode::Swap, None) => false,
+            (Mode::Adaptive, Some(ctx)) => {
+                let decision = self.predict_swap(text, follow_up_for_prediction, ctx);
+                let chose_swap = decision.as_ref().map(|d| d.chose_swap).unwrap_or(false);
+                adaptive_decision = decision;
+                chose_swap
+            }
+            (Mode::Adaptive, None) => false,
+        };
+
+        if use_swap {
+            Ok((disk_context.expect("use_swap only true when disk_context is Some"), adaptive_decision))
+        } else {
+            let (resp, timing) = timed(&self.generator, prime_prompt, None, prime_label)?;
+            self.record_ingest_from_response(&resp, &timing);
+            timings.push(timing);
+            if self.mode != Mode::Raw {
+                self.disk_cache.put(&self.cache_key(content_hash), &serde_json::to_vec(&resp.context)?)?;
+            }
+            Ok((resp.context, adaptive_decision))
+        }
     }
 
     /// Parses `sources` (each either a document Docling can open, or a
@@ -391,36 +483,15 @@ impl<G: Generator> Session<G> {
                 Some(c) => c,
                 None => {
                     let disk_context = if self.mode == Mode::Raw { None } else { current.disk_context.clone() };
-                    let use_swap = match (self.mode, &disk_context) {
-                        (Mode::Raw, _) => false,
-                        (Mode::Swap, Some(_)) => true,
-                        (Mode::Swap, None) => false,
-                        (Mode::Adaptive, Some(ctx)) => {
-                            let decision = self.predict_swap(&text, question, ctx);
-                            let chose_swap = decision.as_ref().map(|d| d.chose_swap).unwrap_or(false);
-                            adaptive_decision = decision;
-                            chose_swap
-                        }
-                        (Mode::Adaptive, None) => false,
-                    };
-
-                    if use_swap {
-                        disk_context.expect("use_swap only true when disk_context is Some")
-                    } else {
-                        let prime_prompt = format!(
-                            "You will be asked questions about the following document. Read it, then wait for the question.\n\n{text}"
-                        );
-                        let (resp, timing) = timed(&self.generator, &prime_prompt, None, "prime")?;
-                        self.record_ingest_from_response(&resp, &timing);
-                        timings.push(timing);
-                        if self.mode != Mode::Raw {
-                            self.disk_cache.put(&self.cache_key(&doc_hash), &serde_json::to_vec(&resp.context)?)?;
-                        }
-                        if let Some(c) = self.current.as_mut() {
-                            c.active_context = Some(resp.context.clone());
-                        }
-                        resp.context
+                    let prime_prompt = format!(
+                        "You will be asked questions about the following document. Read it, then wait for the question.\n\n{text}"
+                    );
+                    let (ctx, decision) = self.resolve_context(&text, &doc_hash, &prime_prompt, "prime", question, disk_context, &mut timings)?;
+                    adaptive_decision = decision;
+                    if let Some(c) = self.current.as_mut() {
+                        c.active_context = Some(ctx.clone());
                     }
+                    ctx
                 }
             };
 
@@ -439,22 +510,47 @@ impl<G: Generator> Session<G> {
                 used_map_reduce: false,
                 chunks_mapped: 0,
                 adaptive_decision,
+                chunk_adaptive_decisions: Vec::new(),
                 timings,
             })
         } else {
-            // Too big for one chunk: question-aware map-reduce. Every
-            // call here is already context-free (no reuse between
-            // chunks), so mode has no further effect on this path - it's
-            // already the "raw" shape by construction.
-            let pieces = chunk::split_to_max(&text, max_chars / 2);
+            // Too big for one chunk: question-aware map-reduce. Each
+            // chunk gets its own disk-cache entry (keyed by its own
+            // content hash) and goes through the same swap/raw/adaptive
+            // decision as the whole-document path - see issue #25 and
+            // `resolve_context`'s doc comment for why only the *primed*
+            // per-chunk state is ever persisted, never a post-extraction
+            // one. No chunk's context is held in memory once the next
+            // chunk starts - only the disk entry survives.
+            let chunk_chars = self.max_map_reduce_chunk_chars();
+            let pieces = chunk::split_to_max(&text, chunk_chars);
             let mut extracted = Vec::new();
+            let mut chunk_adaptive_decisions = Vec::new();
             for (i, piece) in pieces.iter().enumerate() {
-                let prompt = format!(
-                    "From the excerpt below, extract only information relevant to answering this question: {question}\nIf nothing in this excerpt is relevant, reply with exactly: NONE\n\nExcerpt:\n{piece}"
+                let chunk_hash = hash::hash_bytes(piece.as_bytes());
+                let disk_context: Option<Vec<i64>> = if self.mode == Mode::Raw {
+                    None
+                } else {
+                    self.disk_cache.get(&self.cache_key(&chunk_hash))?.map(|b| serde_json::from_slice(&b)).transpose()?
+                };
+
+                let extract_prompt = format!(
+                    "Question: From the excerpt, extract only information relevant to answering: {question}\nIf nothing in the excerpt is relevant, reply with exactly: NONE\nAnswer:"
                 );
-                let (resp, timing) = timed(&self.generator, &prompt, None, &format!("map[{i}]"))?;
-                self.record_ingest_from_response(&resp, &timing);
+                let prime_prompt = format!(
+                    "You will be asked to extract information from the following excerpt. Read it, then wait for the request.\n\n{piece}"
+                );
+                let (context, decision) =
+                    self.resolve_context(piece, &chunk_hash, &prime_prompt, &format!("map[{i}]-prime"), &extract_prompt, disk_context, &mut timings)?;
+                if let Some(d) = decision {
+                    chunk_adaptive_decisions.push(d);
+                }
+
+                let (resp, timing) = timed(&self.generator, &extract_prompt, Some(&context), &format!("map[{i}]"))?;
+                self.record_swap(&resp, &timing);
                 timings.push(timing);
+                // Deliberately not persisting resp.context back to disk -
+                // see resolve_context's doc comment.
                 let text = resp.response.trim().to_string();
                 if !text.eq_ignore_ascii_case("none") && !text.is_empty() {
                     extracted.push(text);
@@ -463,7 +559,7 @@ impl<G: Generator> Session<G> {
 
             let facts = extracted.join("\n---\n");
             let reduce_prompt = format!(
-                "Answer the question using only the extracted facts below. If they do not contain the answer, say so.\n\nQuestion: {question}\n\nExtracted facts:\n{facts}\n\nAnswer:"
+                "Combine the extracted facts below into one final answer.\n\nQuestion: {question}\n\nExtracted facts:\n{facts}\n\nAnswer:"
             );
             let (resp, timing) = timed(&self.generator, &reduce_prompt, None, "reduce")?;
             self.record_ingest_from_response(&resp, &timing);
@@ -474,6 +570,7 @@ impl<G: Generator> Session<G> {
                 used_map_reduce: true,
                 chunks_mapped: pieces.len(),
                 adaptive_decision: None,
+                chunk_adaptive_decisions,
                 timings,
             })
         }
@@ -529,12 +626,12 @@ mod tests {
             *n += 1;
             let mut new_context = context.map(|c| c.to_vec()).unwrap_or_default();
             new_context.push(*n);
-            let response = if prompt.contains("Question") {
-                "a real answer".to_string()
-            } else if prompt.contains("Excerpt") {
-                "NONE".to_string()
+            let response = if prompt.contains("From the excerpt") {
+                "NONE".to_string() // the map-reduce extract follow-up
+            } else if prompt.contains("will be asked") {
+                "primed".to_string() // either prime prompt (whole doc or chunk)
             } else {
-                "primed".to_string()
+                "a real answer".to_string() // single-chunk follow-up, or reduce
             };
             Ok(GenerateResponse {
                 response,
@@ -546,6 +643,16 @@ mod tests {
                 total_duration: 0,
             })
         }
+    }
+
+    /// A big document with *content-distinct* words, unlike
+    /// `"word ".repeat(n)` - naive repetition produces many byte-identical
+    /// chunks, which then legitimately cache-hit against each other
+    /// *within* the same map-reduce pass (correct behavior for genuinely
+    /// duplicate content, but it breaks any test that wants to assert
+    /// "every chunk is cold on a first-ever question").
+    fn unique_big_text(word_count: usize) -> String {
+        (0..word_count).map(|i| format!("word{i} ")).collect()
     }
 
     fn temp_cache(label: &str) -> (Cache, std::path::PathBuf) {
@@ -576,6 +683,7 @@ mod tests {
             context_length,
             work_dir: std::env::temp_dir(),
             mode,
+            map_reduce_context_fraction: DEFAULT_MAP_REDUCE_CONTEXT_FRACTION,
             disk_cache: cache,
             docling_cache,
             speed_profile: None,
@@ -583,6 +691,22 @@ mod tests {
             current: None,
         };
         session.current = Some(CurrentDoc { doc_hash: "testhash".to_string(), text: text.to_string(), disk_context: None, active_context: None });
+        (session, cache_path, docling_path)
+    }
+
+    /// Like `session_with_current`, but with an explicit map-reduce
+    /// context fraction - for tests that need to observe chunk sizing
+    /// change with it (issue #24/#26).
+    fn session_with_current_and_fraction(
+        generator: FakeGenerator,
+        text: &str,
+        context_length: u32,
+        mode: Mode,
+        map_reduce_context_fraction: f32,
+    ) -> (Session<FakeGenerator>, std::path::PathBuf, std::path::PathBuf) {
+        let (session, cache_path, docling_path) = session_with_current(generator, text, context_length, mode);
+        let mut session = session;
+        session.map_reduce_context_fraction = map_reduce_context_fraction;
         (session, cache_path, docling_path)
     }
 
@@ -660,14 +784,117 @@ mod tests {
 
     #[test]
     fn oversized_document_uses_map_reduce() {
-        let big_text = "word ".repeat(100_000); // far larger than a tiny context window allows
+        let big_text = unique_big_text(100_000); // far larger than a tiny context window allows
         let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Swap);
         let report = session.ask("what is this about?").unwrap();
         assert!(report.used_map_reduce);
         assert!(report.chunks_mapped > 1);
-        // one map call per chunk, plus one reduce call
-        assert_eq!(report.timings.len(), report.chunks_mapped + 1);
+        // Every chunk is cold on a first-ever question, so each one pays
+        // a prime + an extract call (see issue #25), plus one final
+        // reduce call.
+        assert_eq!(report.timings.len(), report.chunks_mapped * 2 + 1);
         assert_eq!(report.timings.last().unwrap().label, "reduce");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    // Regression tests for issue #26 (map-reduce context sizing,
+    // per-chunk disk caching, and eviction) - all model-free, using the
+    // same deterministic `FakeGenerator` pattern as the rest of this
+    // module, per that issue's own "no live model needed" requirement.
+
+    #[test]
+    fn smaller_map_reduce_context_fraction_produces_more_chunks() {
+        let big_text = unique_big_text(100_000);
+        let (mut wide, wide_cache, wide_docling) = session_with_current_and_fraction(FakeGenerator::new(), &big_text, 4096, Mode::Swap, 0.5);
+        let (mut narrow, narrow_cache, narrow_docling) = session_with_current_and_fraction(FakeGenerator::new(), &big_text, 4096, Mode::Swap, 0.1);
+
+        let wide_report = wide.ask("what is this about?").unwrap();
+        let narrow_report = narrow.ask("what is this about?").unwrap();
+
+        assert!(
+            narrow_report.chunks_mapped > wide_report.chunks_mapped,
+            "a smaller context fraction should produce more, smaller chunks: wide={}, narrow={}",
+            wide_report.chunks_mapped,
+            narrow_report.chunks_mapped
+        );
+
+        std::fs::remove_file(&wide_cache).ok();
+        std::fs::remove_file(&wide_docling).ok();
+        std::fs::remove_file(&narrow_cache).ok();
+        std::fs::remove_file(&narrow_docling).ok();
+    }
+
+    #[test]
+    fn a_second_different_question_reuses_every_chunks_cached_context_in_swap_mode() {
+        let big_text = unique_big_text(100_000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Swap);
+
+        let first = session.ask("what is this about?").unwrap();
+        let chunk_primes_in_first_call =
+            session.generator.calls.borrow().iter().filter(|p| p.contains("extract information from the following excerpt")).count();
+        assert_eq!(chunk_primes_in_first_call, first.chunks_mapped, "every chunk is cold on the first-ever question");
+
+        let calls_before_second = session.generator.calls.borrow().len();
+        let second = session.ask("a completely different question").unwrap();
+        let chunk_primes_in_second_call = session.generator.calls.borrow()[calls_before_second..]
+            .iter()
+            .filter(|p| p.contains("extract information from the following excerpt"))
+            .count();
+
+        assert_eq!(second.chunks_mapped, first.chunks_mapped, "same document, same chunking");
+        assert_eq!(chunk_primes_in_second_call, 0, "every chunk should already be disk-cached from the first question - no re-priming");
+
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn a_chunks_cached_entry_is_not_contaminated_by_a_past_question() {
+        let big_text = unique_big_text(100_000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Swap);
+
+        session.ask("first question").unwrap();
+
+        // Recompute the same chunk hashes the real code used, and snapshot
+        // every chunk's cache entry right after the first question.
+        let chunk_chars = session.max_map_reduce_chunk_chars();
+        let pieces = chunk::split_to_max(&big_text, chunk_chars);
+        let chunk_hashes: Vec<String> = pieces.iter().map(|p| hash::hash_bytes(p.as_bytes())).collect();
+        let before: Vec<Option<Vec<u8>>> = chunk_hashes.iter().map(|h| session.disk_cache.get(&session.cache_key(h)).unwrap()).collect();
+        assert!(before.iter().all(|e| e.is_some()), "every chunk should have a real cache entry after the first question");
+
+        session.ask("a completely different second question").unwrap();
+
+        let after: Vec<Option<Vec<u8>>> = chunk_hashes.iter().map(|h| session.disk_cache.get(&session.cache_key(h)).unwrap()).collect();
+        assert_eq!(before, after, "a chunk's cached entry must stay the question-independent primed state, never drift to reflect a specific question's answer");
+
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn raw_mode_map_reduce_never_writes_any_chunk_to_the_disk_cache() {
+        let big_text = unique_big_text(100_000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Raw);
+        let report = session.ask("what is this about?").unwrap();
+        assert!(report.used_map_reduce);
+
+        // Recompute the same chunk hashes the real code used and confirm
+        // none of them have a disk entry - checking total entry_count
+        // instead would be too strict, since the (legitimate, mode-
+        // independent) speed profile shares the same disk_cache store
+        // under its own key prefix.
+        let chunk_chars = session.max_map_reduce_chunk_chars();
+        let pieces = chunk::split_to_max(&big_text, chunk_chars);
+        for piece in &pieces {
+            let chunk_hash = hash::hash_bytes(piece.as_bytes());
+            assert_eq!(
+                session.disk_cache.get(&session.cache_key(&chunk_hash)).unwrap(),
+                None,
+                "raw mode must never write any chunk's context to disk"
+            );
+        }
         std::fs::remove_file(&cache_path).ok();
         std::fs::remove_file(&docling_path).ok();
     }
@@ -758,7 +985,17 @@ mod tests {
         let context_length = infer_context_length(REAL_HOST, REAL_MODEL).expect("ollama must be running with qwen2.5:3b pulled");
         let cache = Cache::open(cache_path, 1_000_000_000).unwrap();
         let docling_cache = DoclingCache::open(docling_path, 1_000_000_000).unwrap();
-        Session::open(OllamaClient::new(REAL_HOST, REAL_MODEL, context_length), REAL_MODEL, context_length, std::env::temp_dir(), mode, cache, docling_cache).unwrap()
+        Session::open(
+            OllamaClient::new(REAL_HOST, REAL_MODEL, context_length),
+            REAL_MODEL,
+            context_length,
+            std::env::temp_dir(),
+            mode,
+            DEFAULT_MAP_REDUCE_CONTEXT_FRACTION,
+            cache,
+            docling_cache,
+        )
+        .unwrap()
     }
 
     fn set_current(session: &mut Session<OllamaClient>, doc_hash: &str, text: &str, disk_context: Option<Vec<i64>>) {

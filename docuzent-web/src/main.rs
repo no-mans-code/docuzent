@@ -38,6 +38,11 @@ struct Cli {
     /// Override the model's inferred context window (tokens)
     #[arg(long)]
     context_length: Option<u32>,
+    /// Fraction of the model's context window a single map-reduce chunk
+    /// is sized to use - see the README's "Adaptive Mode" section and
+    /// https://github.com/no-mans-code/docuzent/issues/24
+    #[arg(long, default_value_t = docuzent_core::session::DEFAULT_MAP_REDUCE_CONTEXT_FRACTION)]
+    map_reduce_context_fraction: f32,
     /// Where the on-disk LLM-context cache lives
     #[arg(long, default_value = ".docuzent-cache/context.redb")]
     cache: PathBuf,
@@ -61,6 +66,7 @@ struct SessionState {
     model: String,
     mode_label: String,
     context_length: u32,
+    map_reduce_context_fraction: f32,
 }
 
 struct AppState {
@@ -70,7 +76,16 @@ struct AppState {
     docling_cache_path: PathBuf,
 }
 
-fn open_session_state(host: &str, model: &str, mode_label: &str, context_length_override: Option<u32>, cache_path: &PathBuf, docling_cache_path: &PathBuf) -> Result<SessionState> {
+#[allow(clippy::too_many_arguments)]
+fn open_session_state(
+    host: &str,
+    model: &str,
+    mode_label: &str,
+    context_length_override: Option<u32>,
+    map_reduce_context_fraction: f32,
+    cache_path: &PathBuf,
+    docling_cache_path: &PathBuf,
+) -> Result<SessionState> {
     let mode = Mode::parse(mode_label)?;
     let context_length = match context_length_override {
         Some(n) => n,
@@ -93,8 +108,8 @@ fn open_session_state(host: &str, model: &str, mode_label: &str, context_length_
     let upload_dir = std::env::temp_dir().join("docuzent-web-uploads");
     std::fs::create_dir_all(&upload_dir).ok();
 
-    let session = Session::open(OllamaClient::new(host, model, context_length), model, context_length, upload_dir, mode, cache, docling_cache)?;
-    Ok(SessionState { session, model: model.to_string(), mode_label: mode_label.to_string(), context_length })
+    let session = Session::open(OllamaClient::new(host, model, context_length), model, context_length, upload_dir, mode, map_reduce_context_fraction, cache, docling_cache)?;
+    Ok(SessionState { session, model: model.to_string(), mode_label: mode_label.to_string(), context_length, map_reduce_context_fraction })
 }
 
 #[tokio::main]
@@ -104,7 +119,7 @@ async fn main() -> Result<()> {
     println!("Context cache: {} (capacity {:.1} GB)", cli.cache.display(), kvcache::default_capacity_bytes(&cli.cache)? as f64 / 1e9);
     println!("Docling parse cache: {} (capacity {:.1} GB)", cli.docling_cache.display(), docuzent_core::docling_cache::DEFAULT_CAPACITY_BYTES as f64 / 1e9);
 
-    let session_state = open_session_state(&cli.host, &cli.model, &cli.mode, cli.context_length, &cli.cache, &cli.docling_cache)?;
+    let session_state = open_session_state(&cli.host, &cli.model, &cli.mode, cli.context_length, cli.map_reduce_context_fraction, &cli.cache, &cli.docling_cache)?;
 
     let state = std::sync::Arc::new(AppState {
         state: Mutex::new(Some(session_state)),
@@ -154,6 +169,8 @@ struct ModelInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     context_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    map_reduce_context_fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cache_path: Option<String>,
 }
 
@@ -168,12 +185,13 @@ async fn model_info_handler(State(state): State<std::sync::Arc<AppState>>) -> im
                 model: Some(s.model.clone()),
                 mode: Some(s.mode_label.clone()),
                 context_length: Some(s.context_length),
+                map_reduce_context_fraction: Some(s.map_reduce_context_fraction),
                 cache_path: Some(state.cache_path.display().to_string()),
             }),
         ),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ModelInfoResponse { ok: false, error: Some("session is switching models right now".to_string()), model: None, mode: None, context_length: None, cache_path: None }),
+            Json(ModelInfoResponse { ok: false, error: Some("session is switching models right now".to_string()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None, cache_path: None }),
         ),
     }
 }
@@ -206,6 +224,8 @@ struct SwitchModelRequest {
     mode: Option<String>,
     #[serde(default)]
     context_length: Option<u32>,
+    #[serde(default)]
+    map_reduce_context_fraction: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -219,20 +239,28 @@ struct SwitchModelResponse {
     mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    map_reduce_context_fraction: Option<f32>,
 }
 
 fn switch_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<SwitchModelResponse>) {
-    (status, Json(SwitchModelResponse { ok: false, error: Some(message.into()), model: None, mode: None, context_length: None }))
+    (status, Json(SwitchModelResponse { ok: false, error: Some(message.into()), model: None, mode: None, context_length: None, map_reduce_context_fraction: None }))
 }
 
-/// Switches the active model (and optionally mode/context length) at
-/// runtime - drops the old `Session` (and its cache file handles) before
-/// opening new ones on the same cache paths, so the on-disk caches carry
-/// over rather than starting fresh per model.
+/// Switches the active model (and optionally mode/context length/
+/// map-reduce fraction) at runtime - drops the old `Session` (and its
+/// cache file handles) before opening new ones on the same cache paths,
+/// so the on-disk caches carry over rather than starting fresh per model.
 async fn switch_model_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<SwitchModelRequest>) -> impl IntoResponse {
-    let mode_label = req.mode.unwrap_or_else(|| {
-        state.state.lock().unwrap().as_ref().map(|s| s.mode_label.clone()).unwrap_or_else(|| "adaptive".to_string())
-    });
+    let (mode_label, previous_fraction) = {
+        let guard = state.state.lock().unwrap();
+        let previous = guard.as_ref();
+        (
+            req.mode.clone().or_else(|| previous.map(|s| s.mode_label.clone())).unwrap_or_else(|| "adaptive".to_string()),
+            previous.map(|s| s.map_reduce_context_fraction).unwrap_or(docuzent_core::session::DEFAULT_MAP_REDUCE_CONTEXT_FRACTION),
+        )
+    };
+    let map_reduce_context_fraction = req.map_reduce_context_fraction.unwrap_or(previous_fraction);
 
     // Drop the old session (releasing its cache file handles) before
     // opening new ones on the same paths - see `SessionState`'s doc comment.
@@ -242,11 +270,18 @@ async fn switch_model_handler(State(state): State<std::sync::Arc<AppState>>, Jso
     let cache_path = state.cache_path.clone();
     let docling_cache_path = state.docling_cache_path.clone();
     let model = req.model.clone();
-    let result = tokio::task::spawn_blocking(move || open_session_state(&host, &model, &mode_label, req.context_length, &cache_path, &docling_cache_path)).await;
+    let result = tokio::task::spawn_blocking(move || open_session_state(&host, &model, &mode_label, req.context_length, map_reduce_context_fraction, &cache_path, &docling_cache_path)).await;
 
     match result {
         Ok(Ok(new_state)) => {
-            let response = SwitchModelResponse { ok: true, error: None, model: Some(new_state.model.clone()), mode: Some(new_state.mode_label.clone()), context_length: Some(new_state.context_length) };
+            let response = SwitchModelResponse {
+                ok: true,
+                error: None,
+                model: Some(new_state.model.clone()),
+                mode: Some(new_state.mode_label.clone()),
+                context_length: Some(new_state.context_length),
+                map_reduce_context_fraction: Some(new_state.map_reduce_context_fraction),
+            };
             *state.state.lock().unwrap() = Some(new_state);
             (StatusCode::OK, Json(response))
         }
