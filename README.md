@@ -195,7 +195,17 @@ Traced directly from the code: `docuzent-web` and `docuzent-mcp` each hold exact
 
 Now: a `tokio::sync::Semaphore`-based admission gate (`--max-concurrent-requests` / `DOCUZENT_MAX_CONCURRENT_REQUESTS`, default `1`) makes this explicit and FIFO-fair, and every response reports real, measured `queued_ms` - how long *this* request waited, not a guess. Real, verified: two overlapping `ask_document` calls against the same MCP server showed one return with `queued_ms: 0` and the other with `queued_ms: 7203` - a genuine multi-second wait behind the first call's real Ollama round trip, not a fabricated number.
 
-**This does not add real parallelism** - raising the limit above 1 without a real multi-session pool just means concurrent callers stomp on the same document (repeated cache-eviction thrashing from `Session::load_documents`'s "evict the previous document" behavior), so the default stays 1. A real multi-session pool - admission-controlled by the VRAM estimator above, so as many models as actually fit in free VRAM run truly in parallel - is designed but not yet built; not pub/sub (that's a fan-out pattern, not a request/response admission-control one) but a bounded worker pool behind this same fair queue. See [issue #32](https://github.com/no-mans-code/docuzent/issues/32).
+**This does not add real parallelism** - raising the limit above 1 without a real multi-session pool just means concurrent callers stomp on the same document (repeated cache-eviction thrashing from `Session::load_documents`'s "evict the previous document" behavior), so the default stays 1. A real multi-session pool - admission-controlled by the VRAM estimator above, so as many models as actually fit in free VRAM run truly in parallel - is designed in [issue #33](https://github.com/no-mans-code/docuzent/issues/33), not yet built; not pub/sub (that's a fan-out pattern, not a request/response admission-control one) but a bounded worker pool behind this same fair queue. See [issue #32](https://github.com/no-mans-code/docuzent/issues/32).
+
+---
+
+## Answer citations: which part of the document an answer actually came from
+
+Every `AnswerReport` (CLI, web UI, `docuzent-mcp`) now includes `source_files` - the real file names in the loaded corpus, so an answer never leaves you guessing what it was based on, even on the single-chunk path where no finer-grained locator exists.
+
+For a map-reduced answer, `sources: Vec<AnswerSource>` goes further: which chunk(s) actually contributed a real extraction to the final answer, and the model's own real extraction text for each - not a fabricated snippet, the same output the map phase already produced internally. Real, verified: asking about a specific fact placed at the very start of a 24-chunk document correctly attributed the answer to `chunk 0` alone, with the other 23 chunks' `NONE` extractions correctly excluded.
+
+This is attribution over the existing map-reduce output, not new retrieval - it stays entirely within simple mode's architecture (no embeddings, no vector store; that's the separate, deferred RAG mode). See [issue #34](https://github.com/no-mans-code/docuzent/issues/34).
 
 ---
 

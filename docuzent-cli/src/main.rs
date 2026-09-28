@@ -288,7 +288,21 @@ fn answer_and_print(session: &mut Session<OllamaClient>, question: &str) -> Resu
         );
     }
     println!("]");
+    println!("  sources: {}", report.source_files.join(", "));
+    for s in &report.sources {
+        println!("    [chunk {}] {}", s.chunk_index, truncate_for_display(&s.excerpt, 160));
+    }
     Ok(())
+}
+
+/// Keeps a citation excerpt printable on one line without dumping a
+/// whole chunk's extraction into the terminal.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
 }
 
 fn run_bench(file: PathBuf, model: String, host: String, question: String) -> Result<()> {
