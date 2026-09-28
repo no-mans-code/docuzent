@@ -611,12 +611,32 @@ struct AskResponse {
     /// when uncontended. See
     /// https://github.com/no-mans-code/docuzent/issues/32.
     queued_ms: u64,
+    /// Source file names in the loaded corpus - always present when
+    /// `ok`. See https://github.com/no-mans-code/docuzent/issues/34.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_files: Option<Vec<String>>,
+    /// Per-chunk attribution for a map-reduced answer - empty on the
+    /// single-chunk path (see `source_files` instead).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sources: Option<Vec<docuzent_core::session::AnswerSource>>,
 }
 
 fn ask_error(status: StatusCode, message: impl Into<String>, queued_ms: u64) -> (StatusCode, Json<AskResponse>) {
     (
         status,
-        Json(AskResponse { ok: false, error: Some(message.into()), answer: None, used_map_reduce: None, chunks_mapped: None, adaptive_decision: None, timings: None, ram_offload_warning: None, queued_ms }),
+        Json(AskResponse {
+            ok: false,
+            error: Some(message.into()),
+            answer: None,
+            used_map_reduce: None,
+            chunks_mapped: None,
+            adaptive_decision: None,
+            timings: None,
+            ram_offload_warning: None,
+            queued_ms,
+            source_files: None,
+            sources: None,
+        }),
     )
 }
 
@@ -670,6 +690,8 @@ async fn ask_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): J
                     timings: Some(report.timings),
                     ram_offload_warning: warning,
                     queued_ms,
+                    source_files: Some(report.source_files),
+                    sources: Some(report.sources),
                 }),
             )
         }

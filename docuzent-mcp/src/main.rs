@@ -87,6 +87,15 @@ struct AskDocumentResponse {
     /// `0` when uncontended. See
     /// https://github.com/no-mans-code/docuzent/issues/32.
     queued_ms: u64,
+    /// Source file names in the loaded corpus - always present, so the
+    /// calling agent always knows which files an answer was actually
+    /// based on. See https://github.com/no-mans-code/docuzent/issues/34.
+    source_files: Vec<String>,
+    /// Per-chunk attribution for a map-reduced answer - which chunk(s)
+    /// contributed a real extraction, and the extraction itself. Empty
+    /// on the single-chunk path (see `source_files` instead).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<docuzent_core::session::AnswerSource>,
 }
 
 #[derive(Clone)]
@@ -194,6 +203,8 @@ impl DocuzentTools {
             chars_loaded: load.chars,
             ram_offload_warning,
             queued_ms,
+            source_files: report.source_files,
+            sources: report.sources,
         };
         let text = serde_json::to_string_pretty(&response)
             .map_err(|e| McpError::internal_error(format!("failed to serialize response: {e}"), None))?;

@@ -97,6 +97,11 @@ impl Mode {
 struct CurrentDoc {
     doc_hash: String,
     text: String,
+    /// The source file names in this document set, in load order - so an
+    /// answer can always say *which files* it was asked about, even on
+    /// the single-chunk path where no finer-grained locator exists. See
+    /// https://github.com/no-mans-code/docuzent/issues/34.
+    source_files: Vec<String>,
     /// The context found on disk at load time, if any - not necessarily
     /// *used* yet. `Adaptive` mode decides lazily, on the first real
     /// question, whether to actually warm-start from it.
@@ -149,6 +154,28 @@ pub struct AnswerReport {
     /// disk-cached context to weigh against yet.
     pub chunk_adaptive_decisions: Vec<AdaptiveDecision>,
     pub timings: Vec<CallTiming>,
+    /// The source file names in the loaded corpus - always populated
+    /// (even the single-chunk path can say which files it was asked
+    /// about), so an answer never leaves a caller guessing what it was
+    /// actually based on. See
+    /// https://github.com/no-mans-code/docuzent/issues/34.
+    pub source_files: Vec<String>,
+    /// Per-chunk attribution for the map-reduce path: which chunk(s)
+    /// contributed a real (non-`NONE`) extraction to the final answer,
+    /// and the extraction itself - the model's own real output from the
+    /// map phase, not a fabricated snippet. Empty for the single-chunk
+    /// path, where no finer-grained locator than `source_files` exists.
+    pub sources: Vec<AnswerSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnswerSource {
+    /// Which map-reduce chunk (0-indexed, in document order) this
+    /// excerpt came from.
+    pub chunk_index: usize,
+    /// The real extracted excerpt this chunk contributed - straight from
+    /// the map phase's own output for this chunk, not summarized further.
+    pub excerpt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -412,9 +439,10 @@ impl<G: Generator> Session<G> {
     /// and a combined content hash. Per-file text is cached in
     /// [`DoclingCache`], keyed by that file's own content hash - a file
     /// reused across different document sets is parsed once.
-    fn parse_documents(&self, sources: &[PathBuf]) -> Result<(String, String)> {
+    fn parse_documents(&self, sources: &[PathBuf]) -> Result<(String, String, Vec<String>)> {
         let file_hashes = self.expand_and_hash_files(sources)?;
         let combined_hash = Self::combined_hash(&file_hashes);
+        let source_files: Vec<String> = file_hashes.iter().map(|(f, _)| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
 
         let mut combined = String::new();
         for (file, file_hash) in &file_hashes {
@@ -453,7 +481,7 @@ impl<G: Generator> Session<G> {
             combined.push_str(&text);
         }
 
-        Ok((combined, combined_hash))
+        Ok((combined, combined_hash, source_files))
     }
 
     /// Text-only counterpart to [`Self::parse_documents`]: reads each
@@ -463,9 +491,10 @@ impl<G: Generator> Session<G> {
     /// No attempt at syntax-aware extraction (functions/symbols) - that's
     /// the caller's job, not `Session`'s. See
     /// https://github.com/no-mans-code/docuzent/issues/27.
-    fn parse_text_documents(&self, sources: &[PathBuf]) -> Result<(String, String)> {
+    fn parse_text_documents(&self, sources: &[PathBuf]) -> Result<(String, String, Vec<String>)> {
         let file_hashes = self.expand_and_hash_files(sources)?;
         let combined_hash = Self::combined_hash(&file_hashes);
+        let source_files: Vec<String> = file_hashes.iter().map(|(f, _)| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
 
         let mut combined = String::new();
         for (file, _file_hash) in &file_hashes {
@@ -482,7 +511,7 @@ impl<G: Generator> Session<G> {
             combined.push_str(&text);
         }
 
-        Ok((combined, combined_hash))
+        Ok((combined, combined_hash, source_files))
     }
 
     /// If `new_doc_hash` differs from whatever was previously loaded,
@@ -505,8 +534,8 @@ impl<G: Generator> Session<G> {
     /// is evicted immediately (not left to LRU aging) - see module doc
     /// comment.
     pub fn load_documents(&mut self, sources: &[PathBuf]) -> Result<LoadReport> {
-        let (text, doc_hash) = self.parse_documents(sources)?;
-        self.finish_load(text, doc_hash)
+        let (text, doc_hash, source_files) = self.parse_documents(sources)?;
+        self.finish_load(text, doc_hash, source_files)
     }
 
     /// Convenience wrapper for the common single-file case.
@@ -521,15 +550,15 @@ impl<G: Generator> Session<G> {
     /// identical to the Docling path; only the ingestion front end
     /// differs.
     pub fn load_text_files(&mut self, sources: &[PathBuf]) -> Result<LoadReport> {
-        let (text, doc_hash) = self.parse_text_documents(sources)?;
-        self.finish_load(text, doc_hash)
+        let (text, doc_hash, source_files) = self.parse_text_documents(sources)?;
+        self.finish_load(text, doc_hash, source_files)
     }
 
     /// Shared tail of both [`Self::load_documents`] and
     /// [`Self::load_text_files`]: evicts the previous document set's disk
     /// cache entry if this one is genuinely different, then checks the
     /// disk cache for this one and installs it as `self.current`.
-    fn finish_load(&mut self, text: String, doc_hash: String) -> Result<LoadReport> {
+    fn finish_load(&mut self, text: String, doc_hash: String, source_files: Vec<String>) -> Result<LoadReport> {
         let chars = text.chars().count();
         let fits_in_one_chunk = chars <= self.max_doc_chars();
 
@@ -543,7 +572,7 @@ impl<G: Generator> Session<G> {
             .transpose()?;
         let warm_from_disk = disk_context.is_some();
 
-        self.current = Some(CurrentDoc { doc_hash, text, disk_context, active_context: None });
+        self.current = Some(CurrentDoc { doc_hash, text, source_files, disk_context, active_context: None });
         Ok(LoadReport { chars, fits_in_one_chunk, warm_from_disk })
     }
 
@@ -553,6 +582,7 @@ impl<G: Generator> Session<G> {
         let current = self.current.as_ref().context("no document loaded - call load_documents first")?;
         let doc_hash = current.doc_hash.clone();
         let text = current.text.clone();
+        let source_files = current.source_files.clone();
         let mut timings = Vec::new();
 
         if text.chars().count() <= max_chars {
@@ -595,6 +625,8 @@ impl<G: Generator> Session<G> {
                 adaptive_decision,
                 chunk_adaptive_decisions: Vec::new(),
                 timings,
+                source_files,
+                sources: Vec::new(),
             })
         } else {
             // Too big for one chunk: question-aware map-reduce. Each
@@ -608,6 +640,7 @@ impl<G: Generator> Session<G> {
             let chunk_chars = self.max_map_reduce_chunk_chars();
             let pieces = chunk::split_to_max(&text, chunk_chars);
             let mut extracted = Vec::new();
+            let mut sources = Vec::new();
             let mut chunk_adaptive_decisions = Vec::new();
             for (i, piece) in pieces.iter().enumerate() {
                 let chunk_hash = hash::hash_bytes(piece.as_bytes());
@@ -636,6 +669,7 @@ impl<G: Generator> Session<G> {
                 // see resolve_context's doc comment.
                 let text = resp.text();
                 if !text.eq_ignore_ascii_case("none") && !text.is_empty() {
+                    sources.push(AnswerSource { chunk_index: i, excerpt: text.clone() });
                     extracted.push(text);
                 }
             }
@@ -655,6 +689,8 @@ impl<G: Generator> Session<G> {
                 adaptive_decision: None,
                 chunk_adaptive_decisions,
                 timings,
+                source_files,
+                sources,
             })
         }
     }
@@ -694,11 +730,21 @@ mod tests {
     struct FakeGenerator {
         calls: RefCell<Vec<String>>,
         next_context: RefCell<i64>,
+        /// What the map-reduce extract follow-up returns - `"NONE"` by
+        /// default (matching most tests' focus on caching/mode behavior,
+        /// not extraction content), overridable via
+        /// `new_with_real_extraction` for tests that need a real
+        /// (non-`NONE`) per-chunk extraction, e.g. citations (#34).
+        extraction_response: String,
     }
 
     impl FakeGenerator {
         fn new() -> Self {
-            Self { calls: RefCell::new(Vec::new()), next_context: RefCell::new(0) }
+            Self { calls: RefCell::new(Vec::new()), next_context: RefCell::new(0), extraction_response: "NONE".to_string() }
+        }
+
+        fn new_with_real_extraction(text: &str) -> Self {
+            Self { calls: RefCell::new(Vec::new()), next_context: RefCell::new(0), extraction_response: text.to_string() }
         }
     }
 
@@ -710,7 +756,7 @@ mod tests {
             let mut new_context = context.map(|c| c.to_vec()).unwrap_or_default();
             new_context.push(*n);
             let response = if prompt.contains("From the excerpt") {
-                "NONE".to_string() // the map-reduce extract follow-up
+                self.extraction_response.clone() // the map-reduce extract follow-up
             } else if prompt.contains("will be asked") {
                 "primed".to_string() // either prime prompt (whole doc or chunk)
             } else {
@@ -774,7 +820,7 @@ mod tests {
             disk_bandwidth_bytes_per_sec: 3_000_000_000.0,
             current: None,
         };
-        session.current = Some(CurrentDoc { doc_hash: "testhash".to_string(), text: text.to_string(), disk_context: None, active_context: None });
+        session.current = Some(CurrentDoc { doc_hash: "testhash".to_string(), text: text.to_string(), source_files: vec!["testdoc".to_string()], disk_context: None, active_context: None });
         (session, cache_path, docling_path)
     }
 
@@ -878,6 +924,55 @@ mod tests {
         // reduce call.
         assert_eq!(report.timings.len(), report.chunks_mapped * 2 + 1);
         assert_eq!(report.timings.last().unwrap().label, "reduce");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    // Regression tests for issue #34 (answer citations) - model-free,
+    // per that issue's own scope note that this is attribution over the
+    // existing map-reduce output, not new retrieval.
+
+    #[test]
+    fn single_chunk_path_reports_source_files_but_no_per_chunk_sources() {
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), "a short document", 100_000, Mode::Swap);
+        session.current.as_mut().unwrap().source_files = vec!["report.pdf".to_string()];
+        let report = session.ask("what is this about?").unwrap();
+        assert!(!report.used_map_reduce);
+        assert_eq!(report.source_files, vec!["report.pdf".to_string()]);
+        assert!(report.sources.is_empty(), "no finer-grained locator exists on the single-chunk path");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn map_reduce_path_attributes_the_answer_to_the_chunks_that_actually_contributed() {
+        let big_text = unique_big_text(100_000);
+        let (mut session, cache_path, docling_path) =
+            session_with_current(FakeGenerator::new_with_real_extraction("the document discusses energy resources"), &big_text, 128, Mode::Swap);
+        session.current.as_mut().unwrap().source_files = vec!["ch1.pdf".to_string(), "ch2.pdf".to_string()];
+        let report = session.ask("what energy resources are described?").unwrap();
+
+        assert!(report.used_map_reduce);
+        assert_eq!(report.source_files, vec!["ch1.pdf".to_string(), "ch2.pdf".to_string()]);
+        assert_eq!(report.sources.len(), report.chunks_mapped, "every chunk contributed a real (non-NONE) extraction in this test");
+        for (i, source) in report.sources.iter().enumerate() {
+            assert_eq!(source.chunk_index, i, "sources must be in document order");
+            assert_eq!(source.excerpt, "the document discusses energy resources");
+        }
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn map_reduce_path_omits_sources_for_chunks_that_extracted_nothing() {
+        let big_text = unique_big_text(100_000);
+        // Default FakeGenerator::new() always returns "NONE" for
+        // extraction - every chunk should be correctly omitted from
+        // `sources`, not fabricated as if it contributed.
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Swap);
+        let report = session.ask("what is this about?").unwrap();
+        assert!(report.used_map_reduce);
+        assert!(report.sources.is_empty(), "no chunk extracted anything real in this test - sources must reflect that honestly");
         std::fs::remove_file(&cache_path).ok();
         std::fs::remove_file(&docling_path).ok();
     }
@@ -1151,7 +1246,7 @@ mod tests {
     }
 
     fn set_current(session: &mut Session<OllamaClient>, doc_hash: &str, text: &str, disk_context: Option<Vec<i64>>) {
-        session.current = Some(CurrentDoc { doc_hash: doc_hash.to_string(), text: text.to_string(), disk_context, active_context: None });
+        session.current = Some(CurrentDoc { doc_hash: doc_hash.to_string(), text: text.to_string(), source_files: vec![doc_hash.to_string()], disk_context, active_context: None });
     }
 
     #[test]

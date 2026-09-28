@@ -300,6 +300,25 @@
     margin-right: 6px;
   }
 
+  /* Answer citations - real per-chunk extractions, collapsed by default */
+  details.sources {
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  details.sources summary {
+    cursor: pointer;
+    color: var(--accent);
+  }
+  .source-excerpt {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    line-height: 1.5;
+  }
+
   /* Context-size slider + its live VRAM estimate bar */
   .ctx-row { margin-top: 14px; }
   .ctx-label-row {
@@ -758,10 +777,20 @@ async function askQuestion() {
     const adaptiveBit = data.adaptive_decision
       ? ` · adaptive: swap ${data.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${data.adaptive_decision.predicted_raw_ms.toFixed(0)}ms → chose ${data.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
       : '';
+    const sourceFilesBit = (data.source_files && data.source_files.length)
+      ? `<div class="meta">from: ${data.source_files.map(escapeHtml).join(', ')}</div>`
+      : '';
+    const sourcesBit = (data.sources && data.sources.length)
+      ? `<details class="sources"><summary>${data.sources.length} contributing chunk${data.sources.length === 1 ? '' : 's'}</summary>${
+          data.sources.map(s => `<div class="source-excerpt"><span class="badge">chunk ${s.chunk_index}</span>${escapeHtml(s.excerpt)}</div>`).join('')
+        }</details>`
+      : '';
     turn.innerHTML = `
       <div class="question">${escapeHtml(question)}</div>
       <div class="answer">${escapeHtml(data.answer)}</div>
       <div class="meta"><span class="badge">${modeBit}</span>${metaBits}${adaptiveBit}</div>
+      ${sourceFilesBit}
+      ${sourcesBit}
     `;
     transcript.prepend(turn);
     questionInput.value = '';
