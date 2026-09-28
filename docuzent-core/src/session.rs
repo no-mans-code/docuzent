@@ -349,15 +349,13 @@ impl<G: Generator> Session<G> {
         }
     }
 
-    /// Parses `sources` (each either a document Docling can open, or a
-    /// `.zip` of them, extracted one level deep) into their combined text
-    /// and a combined content hash. Per-file text is cached in
-    /// [`DoclingCache`], keyed by that file's own content hash - a file
-    /// reused across different document sets is parsed once. The combined
-    /// hash is order-independent (hash of the *sorted* per-file hashes),
-    /// so the same set of files always keys identically regardless of
-    /// the order they were passed in.
-    fn parse_documents(&self, sources: &[PathBuf]) -> Result<(String, String)> {
+    /// Expands any `.zip` sources one level deep and returns the flat list
+    /// of files together with each file's own content hash - shared by
+    /// both the Docling ingestion path ([`Self::parse_documents`]) and the
+    /// text-only path ([`Self::parse_text_documents`]), since which
+    /// front-end parses a file's *content* is orthogonal to how the set of
+    /// files itself is assembled and hashed.
+    fn expand_and_hash_files(&self, sources: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
         let mut files: Vec<PathBuf> = Vec::new();
         for source in sources {
             let is_zip = source.extension().map(|e| e.eq_ignore_ascii_case("zip")).unwrap_or(false);
@@ -373,13 +371,26 @@ impl<G: Generator> Session<G> {
                 files.push(source.clone());
             }
         }
+        files.iter().map(|f| Ok::<_, anyhow::Error>((f.clone(), hash::hash_file(f)?))).collect::<Result<_>>()
+    }
 
-        let file_hashes: Vec<(PathBuf, String)> =
-            files.iter().map(|f| Ok::<_, anyhow::Error>((f.clone(), hash::hash_file(f)?))).collect::<Result<_>>()?;
-
+    /// Order-independent combined hash for a document set: the hash of
+    /// the *sorted* per-file hashes, so the same set of files always keys
+    /// identically regardless of the order they were passed in.
+    fn combined_hash(file_hashes: &[(PathBuf, String)]) -> String {
         let mut sorted_hashes: Vec<&str> = file_hashes.iter().map(|(_, h)| h.as_str()).collect();
         sorted_hashes.sort_unstable();
-        let combined_hash = hash::hash_bytes(sorted_hashes.join(",").as_bytes());
+        hash::hash_bytes(sorted_hashes.join(",").as_bytes())
+    }
+
+    /// Parses `sources` (each either a document Docling can open, or a
+    /// `.zip` of them, extracted one level deep) into their combined text
+    /// and a combined content hash. Per-file text is cached in
+    /// [`DoclingCache`], keyed by that file's own content hash - a file
+    /// reused across different document sets is parsed once.
+    fn parse_documents(&self, sources: &[PathBuf]) -> Result<(String, String)> {
+        let file_hashes = self.expand_and_hash_files(sources)?;
+        let combined_hash = Self::combined_hash(&file_hashes);
 
         let mut combined = String::new();
         for (file, file_hash) in &file_hashes {
@@ -421,6 +432,35 @@ impl<G: Generator> Session<G> {
         Ok((combined, combined_hash))
     }
 
+    /// Text-only counterpart to [`Self::parse_documents`]: reads each
+    /// source's raw UTF-8 content directly and skips Docling entirely - for
+    /// files that are already text (`.txt`, `.md`, `.log`, config files,
+    /// source code) and don't need Docling's document-structure parsing.
+    /// No attempt at syntax-aware extraction (functions/symbols) - that's
+    /// the caller's job, not `Session`'s. See
+    /// https://github.com/no-mans-code/docuzent/issues/27.
+    fn parse_text_documents(&self, sources: &[PathBuf]) -> Result<(String, String)> {
+        let file_hashes = self.expand_and_hash_files(sources)?;
+        let combined_hash = Self::combined_hash(&file_hashes);
+
+        let mut combined = String::new();
+        for (file, _file_hash) in &file_hashes {
+            let text = std::fs::read_to_string(file).with_context(|| {
+                format!(
+                    "failed to read `{}` as UTF-8 text - if this isn't a plain-text/code file, use `load_documents` (Docling) instead",
+                    file.display()
+                )
+            })?;
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&format!("=== {} ===\n", file.file_name().unwrap_or_default().to_string_lossy()));
+            combined.push_str(&text);
+        }
+
+        Ok((combined, combined_hash))
+    }
+
     /// If `new_doc_hash` differs from whatever was previously loaded,
     /// evicts the previous document set's LLM-context disk cache entry
     /// immediately rather than leaving it to LRU aging - see module doc
@@ -442,6 +482,30 @@ impl<G: Generator> Session<G> {
     /// comment.
     pub fn load_documents(&mut self, sources: &[PathBuf]) -> Result<LoadReport> {
         let (text, doc_hash) = self.parse_documents(sources)?;
+        self.finish_load(text, doc_hash)
+    }
+
+    /// Convenience wrapper for the common single-file case.
+    pub fn load_document(&mut self, source: &Path) -> Result<LoadReport> {
+        self.load_documents(&[source.to_path_buf()])
+    }
+
+    /// Text-only counterpart to [`Self::load_documents`]: loads one or
+    /// more plain-text/source files directly, skipping Docling entirely -
+    /// see [`Self::parse_text_documents`]. Everything downstream (chunking,
+    /// the LLM-context disk cache, previous-document eviction) is
+    /// identical to the Docling path; only the ingestion front end
+    /// differs.
+    pub fn load_text_files(&mut self, sources: &[PathBuf]) -> Result<LoadReport> {
+        let (text, doc_hash) = self.parse_text_documents(sources)?;
+        self.finish_load(text, doc_hash)
+    }
+
+    /// Shared tail of both [`Self::load_documents`] and
+    /// [`Self::load_text_files`]: evicts the previous document set's disk
+    /// cache entry if this one is genuinely different, then checks the
+    /// disk cache for this one and installs it as `self.current`.
+    fn finish_load(&mut self, text: String, doc_hash: String) -> Result<LoadReport> {
         let chars = text.chars().count();
         let fits_in_one_chunk = chars <= self.max_doc_chars();
 
@@ -457,11 +521,6 @@ impl<G: Generator> Session<G> {
 
         self.current = Some(CurrentDoc { doc_hash, text, disk_context, active_context: None });
         Ok(LoadReport { chars, fits_in_one_chunk, warm_from_disk })
-    }
-
-    /// Convenience wrapper for the common single-file case.
-    pub fn load_document(&mut self, source: &Path) -> Result<LoadReport> {
-        self.load_documents(&[source.to_path_buf()])
     }
 
     /// Answers `question` about whichever document(s) were last loaded.
@@ -962,6 +1021,74 @@ mod tests {
         assert!(decision.chose_swap, "swap should clearly win against a very slow prefill speed");
         assert_eq!(report.timings.len(), 1, "swap path skips the prime call entirely");
         assert_eq!(report.timings[0].label, "answer");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    // load_text_files: text-only ingestion (issue #27) - skips Docling
+    // entirely, so these use a bare session with no document loaded yet
+    // rather than `session_with_current` (which hand-populates `current`
+    // and would bypass the very code path under test here).
+
+    fn bare_session(generator: FakeGenerator, context_length: u32, mode: Mode) -> (Session<FakeGenerator>, std::path::PathBuf, std::path::PathBuf) {
+        let (mut session, cache_path, docling_path) = session_with_current(generator, "", context_length, mode);
+        session.current = None;
+        (session, cache_path, docling_path)
+    }
+
+    #[test]
+    fn load_text_files_reads_raw_content_and_never_touches_the_docling_cache() {
+        let (mut session, cache_path, docling_path) = bare_session(FakeGenerator::new(), 100_000, Mode::Swap);
+        let file = std::env::temp_dir().join(format!("docuzent-core-text-only-test-{}.txt", std::process::id()));
+        std::fs::write(&file, "hello plain text, not a real document").unwrap();
+
+        let report = session.load_text_files(std::slice::from_ref(&file)).unwrap();
+
+        assert!(report.chars > 0);
+        assert!(session.current.as_ref().unwrap().text.contains("hello plain text, not a real document"));
+        let file_hash = hash::hash_file(&file).unwrap();
+        assert_eq!(session.docling_cache.get(&file_hash).unwrap(), None, "text-only loading must never populate the Docling parse cache");
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn load_text_files_combined_hash_is_order_independent_like_load_documents() {
+        let (mut session, cache_path, docling_path) = bare_session(FakeGenerator::new(), 100_000, Mode::Swap);
+        let a = std::env::temp_dir().join(format!("docuzent-core-text-only-order-a-{}.txt", std::process::id()));
+        let b = std::env::temp_dir().join(format!("docuzent-core-text-only-order-b-{}.txt", std::process::id()));
+        std::fs::write(&a, "file a content").unwrap();
+        std::fs::write(&b, "file b content").unwrap();
+
+        session.load_text_files(&[a.clone(), b.clone()]).unwrap();
+        let hash_ab = session.current.as_ref().unwrap().doc_hash.clone();
+        session.load_text_files(&[b.clone(), a.clone()]).unwrap();
+        let hash_ba = session.current.as_ref().unwrap().doc_hash.clone();
+
+        assert_eq!(hash_ab, hash_ba, "the same set of files must hash identically regardless of load order");
+
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn load_text_files_second_load_of_the_same_file_is_warm_from_disk_after_a_real_question() {
+        let (mut session, cache_path, docling_path) = bare_session(FakeGenerator::new(), 100_000, Mode::Swap);
+        let file = std::env::temp_dir().join(format!("docuzent-core-text-only-warm-{}.txt", std::process::id()));
+        std::fs::write(&file, "some source code or plain notes to ask about").unwrap();
+
+        let first = session.load_text_files(std::slice::from_ref(&file)).unwrap();
+        assert!(!first.warm_from_disk);
+        session.ask("what does this say?").unwrap();
+
+        let second = session.load_text_files(std::slice::from_ref(&file)).unwrap();
+        assert!(second.warm_from_disk, "priming from the first load should have persisted a context for this exact file");
+
+        std::fs::remove_file(&file).ok();
         std::fs::remove_file(&cache_path).ok();
         std::fs::remove_file(&docling_path).ok();
     }

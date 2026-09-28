@@ -23,6 +23,10 @@ cargo build --release
 ./target/release/docuzent ask ./report.pdf --model qwen2.5:3b
 ./target/release/docuzent ask ./ch1.pdf ./ch2.pdf --model qwen2.5:3b --mode swap
 
+# Already-text files (plain text, markdown, source code, config) skip
+# Docling entirely with --text-only - see "Text-only ingestion" below
+./target/release/docuzent ask ./src/main.rs --text-only --model qwen2.5:3b
+
 # Benchmark the on-disk context cache's real effect on one document
 ./target/release/docuzent bench ./report.pdf --model qwen2.5:3b
 
@@ -117,6 +121,32 @@ The starting hypothesis going into this (`max_context // 4`, narrower is safer) 
 ### A real bug this same testing surfaced: reasoning models can return an empty answer
 
 `qwen3:0.6b` is a "thinking"-capable model - Ollama reports its internal reasoning in a separate `thinking` field, distinct from `response` (the visible answer). Every call is capped at a fixed generation budget (`num_predict`, 1536 tokens) so a broad question can't run unbounded - but a real compound question showed the model could spend its *entire* budget reasoning and never reach a visible answer at all: `response` came back empty while `thinking` held a real, if incomplete, trace. `GenerateResponse::text()` now falls back to a labeled excerpt of `thinking` when `response` is empty but the model produced something - never a silently blank answer when the model genuinely said something.
+
+---
+
+## Text-only ingestion (skip Docling for plain text/code)
+
+`Session::load_text_files` (CLI: `docuzent ask <files> --text-only`) reads each file's raw UTF-8 content directly and never calls Docling - for `.txt`, `.md`, `.log`, config files, and source code, which are already text and don't need Docling's document-structure parsing. It shares every downstream mechanism with the normal Docling path: `.zip` extraction, the order-independent combined content hash (so the same set of files always keys identically regardless of load order), chunking, and the on-disk LLM-context cache/eviction. Only the ingestion front end differs - no syntax-aware extraction (functions, symbols) happens here, that's left to whatever consumes this mode. See [issue #27](https://github.com/no-mans-code/docuzent/issues/27).
+
+---
+
+## MCP server: document Q&A as a tool for coding agents
+
+`docuzent-mcp` exposes the same `Session`-backed Q&A as an MCP tool over stdio, so a coding agent (coding agent, etc.) can delegate "read this and answer a specific question" to a local Ollama model instead of reading the whole file into its own context - only the answer text crosses back. A second question about the same document set is typically far cheaper than the first: the server keeps one `Session` (`Mode::Adaptive`) alive for its whole process lifetime and reuses the on-disk context cache instead of reprocessing from scratch, and that reuse survives across server restarts too (it's the same disk cache `ask`/`bench` use).
+
+```bash
+cargo build --release -p docuzent-mcp
+assistant mcp add --transport stdio docuzent -- ./target/release/docuzent-mcp
+```
+
+Configured via environment variables (an MCP client launches the server directly, with no natural place for CLI flags): `DOCUZENT_MODEL` (default `qwen2.5:3b`), `DOCUZENT_HOST` (default `http://localhost:11434`), `DOCUZENT_CACHE`/`DOCUZENT_DOCLING_CACHE` (default under `.docuzent-cache/`), `DOCUZENT_MAP_REDUCE_CONTEXT_FRACTION`.
+
+The one tool, **`ask_document(paths: string[], question: string, text_only?: bool)`**:
+- `paths` - one or more files (or `.zip`s of them) loaded as a single combined corpus.
+- `question` - must be real and specific; a bare `"summarize"` or an empty string is rejected outright, since an unfocused ask defeats question-aware map-reduce chunking and risks silently dropping whatever detail the caller actually needed.
+- `text_only` - skip Docling for plain-text/source files (see above); needed before code files can go through this server sensibly.
+
+The response reports `cache_tier` - `"cold"`, `"adaptive-reuse"`, or `"adaptive-reuse-partial (n/m chunks)"` for a map-reduced document - so the calling agent can see the real cost characteristics rather than guessing from latency. Verified for real: a fresh ~67KB text file's first question comes back `"cold"`; the exact same file, in a brand-new server process, on its next question comes back `"adaptive-reuse"` - genuine cross-process disk-cache reuse, not a cosmetic label. See [issue #28](https://github.com/no-mans-code/docuzent/issues/28).
 
 ---
 

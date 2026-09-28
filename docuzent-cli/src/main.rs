@@ -82,6 +82,13 @@ enum Command {
         /// Ask exactly this one question and exit, instead of an interactive loop
         #[arg(long)]
         question: Option<String>,
+        /// Load `files` directly as raw UTF-8 text, skipping Docling
+        /// entirely - for files that are already text (.txt, .md, .log,
+        /// config files, source code) that don't need Docling's
+        /// document-structure parsing. See
+        /// https://github.com/no-mans-code/docuzent/issues/27
+        #[arg(long)]
+        text_only: bool,
     },
     /// Benchmarks the on-disk LLM-context cache's real effect: a cold
     /// session (no cache) vs. a fresh session reusing what the cold one
@@ -104,8 +111,8 @@ fn main() -> Result<()> {
         Command::Ingest { source, output, to, docling_bin, device, no_gpu } => {
             run_ingest(source, output, to, docling_bin, device, no_gpu)
         }
-        Command::Ask { files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question } => {
-            run_ask(files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question)
+        Command::Ask { files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question, text_only } => {
+            run_ask(files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question, text_only)
         }
         Command::Bench { file, model, host, question } => run_bench(file, model, host, question),
     }
@@ -196,11 +203,12 @@ fn run_ask(
     cache: PathBuf,
     docling_cache: PathBuf,
     question: Option<String>,
+    text_only: bool,
 ) -> Result<()> {
     let mode = Mode::parse(&mode)?;
     let mut session = open_session(&model, &host, mode, context_length, map_reduce_context_fraction, &cache, &docling_cache)?;
 
-    let load = session.load_documents(&files)?;
+    let load = if text_only { session.load_text_files(&files)? } else { session.load_documents(&files)? };
     println!(
         "Loaded {} file(s) ({} chars, {}, {})",
         files.len(),
