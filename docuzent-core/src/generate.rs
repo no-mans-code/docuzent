@@ -16,6 +16,32 @@ use serde::{Deserialize, Serialize};
 
 pub trait Generator {
     fn generate(&self, prompt: &str, context: Option<&[i64]>) -> Result<GenerateResponse>;
+
+    /// Same as [`Self::generate`], but invokes `on_token` with each new
+    /// fragment of the response as it's produced - for a caller that
+    /// wants to show a live-updating answer instead of blocking until
+    /// the whole thing is ready. Ollama's `/api/generate` genuinely
+    /// supports this for the *generation* phase via `stream: true`
+    /// (distinct from the prefill/prompt-eval phase, which has no
+    /// equivalent live signal - see `docuzent_core::vram`'s ingestion-
+    /// progress estimate for that separate, unsolvable-for-real problem).
+    ///
+    /// The default implementation here just calls [`Self::generate`] and
+    /// invokes `on_token` once with the whole response - correct, but
+    /// not actually streamed. This exists so [`crate::session::Session`]
+    /// can call `generate_streaming` unconditionally regardless of which
+    /// `Generator` it holds (including test doubles that have no reason
+    /// to implement real streaming) - only [`OllamaClient`] overrides it
+    /// with the real thing. See
+    /// https://github.com/no-mans-code/docuzent/issues/35.
+    fn generate_streaming(&self, prompt: &str, context: Option<&[i64]>, on_token: &mut dyn FnMut(&str)) -> Result<GenerateResponse> {
+        let resp = self.generate(prompt, context)?;
+        let text = resp.text();
+        if !text.is_empty() {
+            on_token(&text);
+        }
+        Ok(resp)
+    }
 }
 
 /// Without an explicit cap, Ollama generates until a natural stop or the
@@ -134,6 +160,61 @@ impl Generator for OllamaClient {
             .context("failed to parse ollama generate response")?;
         Ok(resp)
     }
+
+    /// Real streaming: Ollama's `/api/generate` with `stream: true` sends
+    /// one JSON object per line (newline-delimited, not a single JSON
+    /// document) - each carrying a fragment of `response` (or
+    /// `thinking`, for a reasoning model), until a final line with
+    /// `done: true` that also carries the real aggregate stats
+    /// (`prompt_eval_count`, durations, etc.) this project's timing
+    /// already depends on. Reads the body incrementally via `ureq`'s
+    /// `into_reader()` rather than buffering the whole response first -
+    /// otherwise `on_token` would only ever fire once, defeating the
+    /// point.
+    fn generate_streaming(&self, prompt: &str, context: Option<&[i64]>, on_token: &mut dyn FnMut(&str)) -> Result<GenerateResponse> {
+        let url = format!("{}/api/generate", self.host.trim_end_matches('/'));
+        let req = GenerateRequest { model: &self.model, prompt, stream: true, context, options: GenerateOptions { num_ctx: self.num_ctx, num_predict: DEFAULT_NUM_PREDICT } };
+        let http_resp = ureq::post(&url).send_json(req).with_context(|| format!("ollama generate request to {url} failed - is `ollama serve` running?"))?;
+
+        let reader = std::io::BufReader::new(http_resp.into_reader());
+        let mut response_text = String::new();
+        let mut thinking_text = String::new();
+        let mut last_line: Option<GenerateResponse> = None;
+        for line in std::io::BufRead::lines(reader) {
+            let line = line.context("failed to read a line of ollama's streamed response")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let partial: GenerateResponse = serde_json::from_str(&line).context("failed to parse a line of ollama's streamed response")?;
+            if !partial.response.is_empty() {
+                on_token(&partial.response);
+                response_text.push_str(&partial.response);
+            }
+            if let Some(t) = &partial.thinking {
+                thinking_text.push_str(t);
+            }
+            last_line = Some(partial); // the final (done: true) line carries the real aggregate stats
+        }
+
+        let mut resp = last_line.context("ollama's streamed response ended with no lines at all - is `ollama serve` still running?")?;
+        resp.response = response_text;
+        resp.thinking = if thinking_text.is_empty() { None } else { Some(thinking_text) };
+
+        // A reasoning model can spend its whole budget in `thinking` and
+        // never stream a visible `response` fragment at all (the same
+        // real failure `GenerateResponse::text()` exists for) - fire the
+        // same labeled fallback once here too, so a caller watching the
+        // stream isn't left staring at nothing when the non-streaming
+        // path would have shown something.
+        if resp.response.trim().is_empty() {
+            let fallback = resp.text();
+            if !fallback.is_empty() {
+                on_token(&fallback);
+            }
+        }
+
+        Ok(resp)
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +254,42 @@ mod tests {
     fn text_ignores_an_empty_thinking_field_and_stays_empty() {
         let resp = GenerateResponse { response: "".to_string(), thinking: Some("   ".to_string()), ..Default::default() };
         assert_eq!(resp.text(), "");
+    }
+
+    /// A generator that doesn't implement real streaming, matching the
+    /// test doubles used elsewhere in this project (e.g.
+    /// `session::tests::FakeGenerator`) - relies entirely on
+    /// `Generator::generate_streaming`'s default implementation.
+    struct NonStreamingFakeGenerator;
+    impl Generator for NonStreamingFakeGenerator {
+        fn generate(&self, _prompt: &str, _context: Option<&[i64]>) -> Result<GenerateResponse> {
+            Ok(GenerateResponse { response: "a complete fake answer".to_string(), ..Default::default() })
+        }
+    }
+
+    #[test]
+    fn default_generate_streaming_calls_the_callback_once_with_the_whole_response() {
+        let gen = NonStreamingFakeGenerator;
+        let mut fragments = Vec::new();
+        let resp = gen.generate_streaming("irrelevant", None, &mut |t| fragments.push(t.to_string())).unwrap();
+        assert_eq!(resp.response, "a complete fake answer");
+        assert_eq!(fragments, vec!["a complete fake answer".to_string()], "the default impl isn't real streaming, but must still call back exactly once with the full text");
+    }
+
+    // Real-Ollama streaming check below - `#[ignore]`d by default (run
+    // with `cargo test -- --ignored`), needs a live `ollama serve` with
+    // `qwen2.5:3b` pulled.
+
+    #[test]
+    #[ignore]
+    fn real_ollama_streaming_calls_back_multiple_times_and_matches_the_non_streaming_answer() {
+        let client = OllamaClient::new("http://localhost:11434", "qwen2.5:3b", 4096);
+        let mut fragments: Vec<String> = Vec::new();
+        let streamed = client.generate_streaming("Say exactly: The quick brown fox jumps over the lazy dog.", None, &mut |t| fragments.push(t.to_string())).unwrap();
+
+        assert!(fragments.len() > 1, "a real multi-token answer should stream in more than one fragment, got {}", fragments.len());
+        assert_eq!(fragments.concat(), streamed.response, "concatenating every streamed fragment must reproduce the final response exactly");
+        assert!(streamed.prompt_eval_count > 0, "the final streamed line must still carry real aggregate stats");
+        println!("real streamed answer ({} fragments): {:?}", fragments.len(), streamed.response);
     }
 }

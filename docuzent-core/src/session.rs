@@ -662,6 +662,16 @@ impl<G: Generator> Session<G> {
 
     /// Answers `question` about whichever document(s) were last loaded.
     pub fn ask(&mut self, question: &str) -> Result<AnswerReport> {
+        self.ask_streaming(question, &mut |_| {})
+    }
+
+    /// Same as [`Self::ask`], but invokes `on_token` with each fragment
+    /// of the *final* answer text as it's generated - the single-chunk
+    /// "answer" call, or map-reduce's "reduce" call. Every other call
+    /// this makes (priming, map-reduce's per-chunk extraction) is never
+    /// shown to a user and stays non-streamed, same as before - see
+    /// https://github.com/no-mans-code/docuzent/issues/35.
+    pub fn ask_streaming(&mut self, question: &str, on_token: &mut dyn FnMut(&str)) -> Result<AnswerReport> {
         let max_chars = self.max_doc_chars();
         let current = self.current.as_ref().context("no document loaded - call load_documents first")?;
         let doc_hash = current.doc_hash.clone();
@@ -710,7 +720,7 @@ impl<G: Generator> Session<G> {
                 }
             };
 
-            let (resp, timing) = timed(&self.generator, &format!("Question: {question}\nAnswer:"), Some(&context), "answer")?;
+            let (resp, timing) = timed_streaming(&self.generator, &format!("Question: {question}\nAnswer:"), Some(&context), "answer", on_token)?;
             self.record_swap(&resp, &timing);
             timings.push(timing);
             if self.mode != Mode::Raw {
@@ -780,7 +790,7 @@ impl<G: Generator> Session<G> {
             let reduce_prompt = format!(
                 "Combine the extracted facts below into one final answer.\n\nQuestion: {question}\n\nExtracted facts:\n{facts}\n\nAnswer:"
             );
-            let (resp, timing) = timed(&self.generator, &reduce_prompt, None, "reduce")?;
+            let (resp, timing) = timed_streaming(&self.generator, &reduce_prompt, None, "reduce", on_token)?;
             self.record_ingest_from_response(&resp, &timing);
             timings.push(timing);
 
@@ -806,6 +816,29 @@ fn timed<G: Generator>(
 ) -> Result<(GenerateResponse, CallTiming)> {
     let t0 = std::time::Instant::now();
     let resp = generator.generate(prompt, context)?;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let timing = CallTiming {
+        label: label.to_string(),
+        prompt_eval_count: resp.prompt_eval_count,
+        prompt_eval_duration_ms: resp.prompt_eval_duration as f64 / 1e6,
+        eval_duration_ms: resp.eval_duration as f64 / 1e6,
+        wall_ms,
+    };
+    Ok((resp, timing))
+}
+
+/// Same as [`timed`], but for the one call a caller actually wants to
+/// watch live - see [`Generator::generate_streaming`] and
+/// `Session::ask_streaming`.
+fn timed_streaming<G: Generator>(
+    generator: &G,
+    prompt: &str,
+    context: Option<&[i64]>,
+    label: &str,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<(GenerateResponse, CallTiming)> {
+    let t0 = std::time::Instant::now();
+    let resp = generator.generate_streaming(prompt, context, on_token)?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let timing = CallTiming {
         label: label.to_string(),
@@ -961,6 +994,45 @@ mod tests {
         assert_eq!(report.timings.len(), 2);
         assert_eq!(report.timings[0].label, "prime");
         assert_eq!(report.timings[1].label, "answer");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    // Regression tests for issue #35 (streaming) - model-free.
+    // `FakeGenerator` never overrides `generate_streaming`, so these
+    // exercise the real default trait behavior described there: exactly
+    // one callback, with the whole final answer.
+
+    #[test]
+    fn ask_streaming_invokes_the_callback_with_the_final_answer() {
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), "a short document", 100_000, Mode::Swap);
+        let mut fragments = Vec::new();
+        let report = session.ask_streaming("what is this about?", &mut |t| fragments.push(t.to_string())).unwrap();
+        assert_eq!(fragments, vec![report.answer.clone()], "the default (non-real) streaming impl must still call back exactly once with the whole answer");
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn ask_streaming_only_streams_the_reduce_call_not_map_reduces_per_chunk_extraction() {
+        let big_text = unique_big_text(100_000);
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), &big_text, 128, Mode::Swap);
+        let mut fragments = Vec::new();
+        let report = session.ask_streaming("what is this about?", &mut |t| fragments.push(t.to_string())).unwrap();
+        assert!(report.used_map_reduce);
+        // Only the final reduce call streams - every per-chunk extraction
+        // (never shown to a user) does not, regardless of how many
+        // chunks there were.
+        assert_eq!(fragments, vec![report.answer.clone()]);
+        std::fs::remove_file(&cache_path).ok();
+        std::fs::remove_file(&docling_path).ok();
+    }
+
+    #[test]
+    fn ask_without_a_callback_behaves_exactly_as_before() {
+        let (mut session, cache_path, docling_path) = session_with_current(FakeGenerator::new(), "a short document", 100_000, Mode::Swap);
+        let report = session.ask("what is this about?").unwrap();
+        assert_eq!(report.answer, "a real answer");
         std::fs::remove_file(&cache_path).ok();
         std::fs::remove_file(&docling_path).ok();
     }

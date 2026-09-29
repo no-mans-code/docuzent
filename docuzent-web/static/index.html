@@ -747,6 +747,13 @@ function stopTokenProgressPolling() {
   tokenProgress.classList.remove('visible');
 }
 
+// Reads /ask-stream's Server-Sent Events manually (not the native
+// EventSource API, since that only supports GET - this needs a JSON
+// POST body) - splits the raw response body on the SSE "\n\n" event
+// delimiter, parsing each event's `data:` line as JSON. A `{"token":...}`
+// event is a real, live fragment of the answer as Ollama actually
+// generates it (see docuzent#35) - anything else is the final
+// AskResponse-shaped summary.
 async function askQuestion() {
   const question = questionInput.value.trim();
   if (!question) return;
@@ -756,47 +763,81 @@ async function askQuestion() {
   askStatus.innerHTML = '<span class="badge">thinking</span>working through the document…';
   startTokenProgressPolling();
 
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  const answerDiv = document.createElement('div');
+  answerDiv.className = 'answer';
+  turn.innerHTML = `<div class="question">${escapeHtml(question)}</div>`;
+  turn.appendChild(answerDiv);
+  transcript.prepend(turn);
+
   try {
-    const resp = await fetch('/ask', {
+    const resp = await fetch('/ask-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question }),
     });
-    const data = await resp.json();
+    if (!resp.ok || !resp.body) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalData = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sepIndex;
+      while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        const dataLine = rawEvent.split('\n').find(l => l.startsWith('data:'));
+        if (!dataLine) continue;
+        let data;
+        try { data = JSON.parse(dataLine.slice(5).trim()); } catch (e) { continue; }
+        if ('token' in data) {
+          answerDiv.textContent += data.token;
+        } else {
+          finalData = data;
+        }
+      }
+    }
+
     stopTokenProgressPolling();
-    if (!data.ok) {
-      setStatus(askStatus, data.error || 'Failed to answer.', 'error');
+    if (!finalData || !finalData.ok) {
+      setStatus(askStatus, (finalData && finalData.error) || 'Failed to answer.', 'error');
+      turn.remove();
       return;
     }
     setStatus(askStatus, '', null);
-    showRamOffloadBadge(data.ram_offload_warning);
-    const turn = document.createElement('div');
-    turn.className = 'turn';
-    const metaBits = data.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(' · ');
-    const modeBit = data.used_map_reduce ? `map-reduce · ${data.chunks_mapped} chunks` : 'single chunk';
-    const adaptiveBit = data.adaptive_decision
-      ? ` · adaptive: swap ${data.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${data.adaptive_decision.predicted_raw_ms.toFixed(0)}ms → chose ${data.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
+    showRamOffloadBadge(finalData.ram_offload_warning);
+    const metaBits = finalData.timings.map(t => `${t.label}: ${t.prompt_eval_duration_ms.toFixed(0)}ms/${t.prompt_eval_count}tok`).join(' · ');
+    const modeBit = finalData.used_map_reduce ? `map-reduce · ${finalData.chunks_mapped} chunks` : 'single chunk';
+    const adaptiveBit = finalData.adaptive_decision
+      ? ` · adaptive: swap ${finalData.adaptive_decision.predicted_swap_ms.toFixed(0)}ms vs raw ${finalData.adaptive_decision.predicted_raw_ms.toFixed(0)}ms → chose ${finalData.adaptive_decision.chose_swap ? 'swap' : 'raw'}`
       : '';
-    const sourceFilesBit = (data.source_files && data.source_files.length)
-      ? `<div class="meta">from: ${data.source_files.map(escapeHtml).join(', ')}</div>`
+    const sourceFilesBit = (finalData.source_files && finalData.source_files.length)
+      ? `<div class="meta">from: ${finalData.source_files.map(escapeHtml).join(', ')}</div>`
       : '';
-    const sourcesBit = (data.sources && data.sources.length)
-      ? `<details class="sources"><summary>${data.sources.length} contributing chunk${data.sources.length === 1 ? '' : 's'}</summary>${
-          data.sources.map(s => `<div class="source-excerpt"><span class="badge">chunk ${s.chunk_index}</span>${escapeHtml(s.excerpt)}</div>`).join('')
+    const sourcesBit = (finalData.sources && finalData.sources.length)
+      ? `<details class="sources"><summary>${finalData.sources.length} contributing chunk${finalData.sources.length === 1 ? '' : 's'}</summary>${
+          finalData.sources.map(s => `<div class="source-excerpt"><span class="badge">chunk ${s.chunk_index}</span>${escapeHtml(s.excerpt)}</div>`).join('')
         }</details>`
       : '';
-    turn.innerHTML = `
-      <div class="question">${escapeHtml(question)}</div>
-      <div class="answer">${escapeHtml(data.answer)}</div>
-      <div class="meta"><span class="badge">${modeBit}</span>${metaBits}${adaptiveBit}</div>
-      ${sourceFilesBit}
-      ${sourcesBit}
-    `;
-    transcript.prepend(turn);
+    const metaWrap = document.createElement('div');
+    metaWrap.innerHTML = `<div class="meta"><span class="badge">${modeBit}</span>${metaBits}${adaptiveBit}</div>${sourceFilesBit}${sourcesBit}`;
+    turn.appendChild(metaWrap);
+    // Real streamed fragments should already add up to this exactly -
+    // reconciling here is just a safety net against any boundary quirk.
+    answerDiv.textContent = finalData.answer;
     questionInput.value = '';
   } catch (e) {
     stopTokenProgressPolling();
     setStatus(askStatus, 'Request failed: ' + e, 'error');
+    turn.remove();
   } finally {
     askBtn.disabled = false;
     questionInput.disabled = false;

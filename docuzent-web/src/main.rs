@@ -4,9 +4,11 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use tokio_stream::{Stream, StreamExt};
 use clap::Parser;
 use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
@@ -187,6 +189,7 @@ async fn main() -> Result<()> {
         .route("/model", post(switch_model_handler))
         .route("/load", post(load_handler))
         .route("/ask", post(ask_handler))
+        .route("/ask-stream", post(ask_stream_handler))
         .route("/progress", get(progress_handler))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
@@ -621,23 +624,26 @@ struct AskResponse {
     sources: Option<Vec<docuzent_core::session::AnswerSource>>,
 }
 
+/// The `AskResponse` shape for an error, shared by `/ask` and
+/// `/ask-stream` so both build it identically.
+fn ask_error_body(message: &str, queued_ms: u64) -> AskResponse {
+    AskResponse {
+        ok: false,
+        error: Some(message.to_string()),
+        answer: None,
+        used_map_reduce: None,
+        chunks_mapped: None,
+        adaptive_decision: None,
+        timings: None,
+        ram_offload_warning: None,
+        queued_ms,
+        source_files: None,
+        sources: None,
+    }
+}
+
 fn ask_error(status: StatusCode, message: impl Into<String>, queued_ms: u64) -> (StatusCode, Json<AskResponse>) {
-    (
-        status,
-        Json(AskResponse {
-            ok: false,
-            error: Some(message.into()),
-            answer: None,
-            used_map_reduce: None,
-            chunks_mapped: None,
-            adaptive_decision: None,
-            timings: None,
-            ram_offload_warning: None,
-            queued_ms,
-            source_files: None,
-            sources: None,
-        }),
-    )
+    (status, Json(ask_error_body(&message.into(), queued_ms)))
 }
 
 async fn ask_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<AskRequest>) -> impl IntoResponse {
@@ -698,6 +704,83 @@ async fn ask_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): J
         Ok(Err(e)) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
         Err(e) => ask_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), queued_ms),
     }
+}
+
+/// Same as `/ask`, but streams the final answer token-by-token over
+/// Server-Sent Events as it's actually generated (Ollama's real
+/// `stream: true`, not an estimate) instead of blocking until the whole
+/// answer is ready - see
+/// https://github.com/no-mans-code/docuzent/issues/35. Each event's
+/// `data` is a JSON object: `{"token": "..."}` for a fragment, or the
+/// full `AskResponse` shape (with `"ok"`/`"answer"`/etc.) as the final
+/// event, distinguishable by the absence of a `"token"` key.
+async fn ask_stream_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<AskRequest>) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        let queue_start = std::time::Instant::now();
+        let _permit = state.request_gate.acquire().await;
+        let queued_ms = queue_start.elapsed().as_millis() as u64;
+
+        let model = {
+            let guard = state.state.lock().unwrap();
+            let Some(session_state) = guard.as_ref() else {
+                let _ = tx.send(serde_json::to_string(&ask_error_body("session is switching models right now - try again in a moment", queued_ms)).unwrap());
+                return;
+            };
+            let total_estimated_tokens = (session_state.session.current_text_len_chars().unwrap_or(0) / docuzent_core::session::CHARS_PER_TOKEN).max(1) as u64;
+            let tokens_per_sec = session_state.session.estimated_prefill_tokens_per_sec().unwrap_or(0.0);
+            *state.progress.lock().unwrap() = Some(ProgressSnapshot { total_estimated_tokens, tokens_per_sec, started_at: std::time::Instant::now(), label: "answering".to_string() });
+            session_state.model.clone()
+        };
+        let host = state.host.clone();
+
+        let question = req.question.clone();
+        let result = tokio::task::spawn_blocking({
+            let state = state.clone();
+            let tx = tx.clone();
+            move || {
+                let mut guard = state.state.lock().unwrap();
+                let Some(session_state) = guard.as_mut() else {
+                    anyhow::bail!("session is switching models right now - try again in a moment");
+                };
+                session_state.session.ask_streaming(&question, &mut |fragment| {
+                    let _ = tx.send(serde_json::json!({ "token": fragment }).to_string());
+                })
+            }
+        })
+        .await;
+
+        *state.progress.lock().unwrap() = None;
+
+        let final_body = match result {
+            Ok(Ok(report)) => {
+                let warning = tokio::task::spawn_blocking(move || ram_offload_warning(&host, &model)).await.ok().flatten();
+                serde_json::to_string(&AskResponse {
+                    ok: true,
+                    error: None,
+                    answer: Some(report.answer),
+                    used_map_reduce: Some(report.used_map_reduce),
+                    chunks_mapped: Some(report.chunks_mapped),
+                    adaptive_decision: report.adaptive_decision,
+                    timings: Some(report.timings),
+                    ram_offload_warning: warning,
+                    queued_ms,
+                    source_files: Some(report.source_files),
+                    sources: Some(report.sources),
+                })
+            }
+            Ok(Err(e)) => serde_json::to_string(&ask_error_body(&e.to_string(), queued_ms)),
+            Err(e) => serde_json::to_string(&ask_error_body(&e.to_string(), queued_ms)),
+        };
+        let _ = tx.send(final_body.unwrap_or_else(|e| format!(r#"{{"ok":false,"error":"failed to serialize response: {e}"}}"#)));
+        // `tx` drops here (its earlier clone already dropped when the
+        // spawn_blocking closure returned), closing the channel and
+        // ending the SSE stream.
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|body| Ok(Event::default().data(body)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Keeps just the base filename, stripped of any path components - the
