@@ -481,6 +481,22 @@
     </div>
   </section>
 
+  <section class="panel">
+    <div class="row">
+      <div class="field">
+        <label for="workspaceSelect">Saved workspaces</label>
+        <select id="workspaceSelect"><option value="">— none saved —</option></select>
+      </div>
+      <div class="field shrink"><label>&nbsp;</label><button id="loadWorkspaceBtn">Load</button></div>
+      <div class="field shrink"><label>&nbsp;</label><button id="deleteWorkspaceBtn">Delete</button></div>
+    </div>
+    <div class="row" style="margin-top: 10px;">
+      <input type="text" id="workspaceNameInput" placeholder="Name this workspace to save the currently loaded document(s)…">
+      <button id="saveWorkspaceBtn">Save current as workspace</button>
+    </div>
+    <div class="status" id="workspaceStatus"></div>
+  </section>
+
   <section class="panel" id="qaSection">
     <div class="row">
       <input type="text" id="questionInput" placeholder="Ask a question about this document…">
@@ -501,6 +517,12 @@
 const loadBtn = document.getElementById('loadBtn');
 const fileInput = document.getElementById('fileInput');
 const textOnlyCheckbox = document.getElementById('textOnlyCheckbox');
+const workspaceSelect = document.getElementById('workspaceSelect');
+const loadWorkspaceBtn = document.getElementById('loadWorkspaceBtn');
+const deleteWorkspaceBtn = document.getElementById('deleteWorkspaceBtn');
+const workspaceNameInput = document.getElementById('workspaceNameInput');
+const saveWorkspaceBtn = document.getElementById('saveWorkspaceBtn');
+const workspaceStatus = document.getElementById('workspaceStatus');
 const loadStatus = document.getElementById('loadStatus');
 const loadProgress = document.getElementById('loadProgress');
 const progressFill = document.getElementById('progressFill');
@@ -937,7 +959,111 @@ questionInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') askQue
 contextSlider.addEventListener('input', renderVramEstimate);
 modelSelect.addEventListener('change', () => fetchContextEstimateFor(modelSelect.value));
 
+// Persisted, named document workspaces - a thin save/reload layer over
+// /load, not a new upload mechanism (see docuzent#38). Loading a saved
+// workspace reuses the on-disk cache for real when it's still there.
+async function refreshWorkspaceList() {
+  try {
+    const resp = await fetch('/workspaces');
+    const data = await resp.json();
+    if (!data.ok) return;
+    const names = Object.keys(data.workspaces).sort();
+    workspaceSelect.innerHTML = '<option value="">— none saved —</option>' + names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+  } catch (e) { /* non-critical - the list just won't refresh this time */ }
+}
+
+async function saveWorkspace() {
+  const name = workspaceNameInput.value.trim();
+  if (!name) {
+    setStatus(workspaceStatus, 'Name the workspace first.', 'error');
+    return;
+  }
+  saveWorkspaceBtn.disabled = true;
+  try {
+    const resp = await fetch('/workspaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(workspaceStatus, data.error || 'Failed to save.', 'error');
+      return;
+    }
+    setStatus(workspaceStatus, `Saved "${name}".`, 'ok');
+    workspaceNameInput.value = '';
+    await refreshWorkspaceList();
+    workspaceSelect.value = name;
+  } catch (e) {
+    setStatus(workspaceStatus, 'Request failed: ' + e, 'error');
+  } finally {
+    saveWorkspaceBtn.disabled = false;
+  }
+}
+
+async function loadWorkspace() {
+  const name = workspaceSelect.value;
+  if (!name) {
+    setStatus(workspaceStatus, 'Pick a saved workspace first.', 'error');
+    return;
+  }
+  loadWorkspaceBtn.disabled = true;
+  setStatus(workspaceStatus, `Loading "${name}"…`, null);
+  try {
+    const resp = await fetch('/workspaces/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(workspaceStatus, data.error || 'Failed to load.', 'error');
+      return;
+    }
+    setStatus(workspaceStatus, `Loaded "${name}" - ${data.chars.toLocaleString()} chars, ${data.warm_from_disk ? 'a cached context is available on disk' : 'cold, not seen before'}.`, 'ok');
+    qaSection.classList.add('visible');
+    transcript.innerHTML = '';
+    questionInput.focus();
+  } catch (e) {
+    setStatus(workspaceStatus, 'Request failed: ' + e, 'error');
+  } finally {
+    loadWorkspaceBtn.disabled = false;
+  }
+}
+
+async function deleteWorkspace() {
+  const name = workspaceSelect.value;
+  if (!name) {
+    setStatus(workspaceStatus, 'Pick a saved workspace first.', 'error');
+    return;
+  }
+  deleteWorkspaceBtn.disabled = true;
+  try {
+    const resp = await fetch('/workspaces/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      setStatus(workspaceStatus, data.error || 'Failed to delete.', 'error');
+      return;
+    }
+    setStatus(workspaceStatus, `Deleted "${name}".`, 'ok');
+    await refreshWorkspaceList();
+  } catch (e) {
+    setStatus(workspaceStatus, 'Request failed: ' + e, 'error');
+  } finally {
+    deleteWorkspaceBtn.disabled = false;
+  }
+}
+
+saveWorkspaceBtn.addEventListener('click', saveWorkspace);
+loadWorkspaceBtn.addEventListener('click', loadWorkspace);
+deleteWorkspaceBtn.addEventListener('click', deleteWorkspace);
+
 loadModelList().then(refreshModelInfo);
+refreshWorkspaceList();
 </script>
 </body>
 </html>
