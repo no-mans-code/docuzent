@@ -273,8 +273,14 @@ fn run_ask(
 }
 
 fn answer_and_print(session: &mut Session<OllamaClient>, question: &str) -> Result<()> {
-    let report = session.ask(question)?;
-    println!("{}", report.answer);
+    // Streams the final answer token-by-token as it's generated - real
+    // streaming (Ollama's `stream: true`), not an estimate; see
+    // https://github.com/no-mans-code/docuzent/issues/35.
+    let report = session.ask_streaming(question, &mut |fragment| {
+        print!("{fragment}");
+        io::stdout().flush().ok();
+    })?;
+    println!();
     print!("  [{}", if report.used_map_reduce { format!("map-reduce over {} chunks", report.chunks_mapped) } else { "single chunk".to_string() });
     for t in &report.timings {
         print!(", {}: {:.0}ms prompt_eval ({} tok)", t.label, t.prompt_eval_duration_ms, t.prompt_eval_count);

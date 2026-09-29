@@ -203,6 +203,14 @@ Ollama's API exposes no live prefill-progress signal - there is no partial-progr
 
 ---
 
+## Streaming: the final answer arrives token-by-token, for real
+
+Unlike prefill (no real progress signal exists, see above), Ollama's *generation* phase genuinely supports live streaming - `stream: true` on `/api/generate` sends one real JSON fragment per token, not an estimate. `Session::ask_streaming` (CLI: `docuzent ask` now prints the answer as it's generated; web: `POST /ask-stream`, Server-Sent Events) wires this up for the one call a user actually watches - the single-chunk answer, or map-reduce's final reduce step. Every other call (priming, map-reduce's per-chunk extraction) is never shown to a user and stays non-streamed, exactly as before.
+
+`Generator::generate_streaming` is a trait method with a default implementation (call the normal blocking `generate`, then invoke the callback once with the whole result) - test doubles get correct-but-not-actually-streamed behavior for free, and only `OllamaClient` overrides it with the real thing, so `Session` can call it unconditionally regardless of which `Generator` it holds. Real, verified: a live call streamed 52 real token fragments that concatenate back to exactly the same answer text the server's own final summary reports. `docuzent-mcp` stays non-streaming for now - MCP's `tools/call` doesn't have an obvious first-class streaming-text primitive the way a chat UI's SSE connection does; worth a closer look at what `rmcp` actually supports before building something there. See [issue #35](https://github.com/no-mans-code/docuzent/issues/35).
+
+---
+
 ## Concurrent requests: explicit, fair, and observable (not yet parallel)
 
 Traced directly from the code: `docuzent-web` and `docuzent-mcp` each hold exactly one active `Session` (one document, one model) behind a lock - by design, since loading a new document evicts the previous one. Before this, concurrent requests just contended for that lock with no fairness guarantee, no configurable limit, and no visibility into how long a request actually waited.
