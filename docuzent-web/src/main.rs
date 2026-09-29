@@ -9,6 +9,9 @@ use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use tokio_stream::{Stream, StreamExt};
+
+mod workspaces;
+use workspaces::WorkspaceManager;
 use clap::Parser;
 use docuzent_core::docling_cache::DoclingCache;
 use docuzent_core::generate::OllamaClient;
@@ -86,6 +89,12 @@ struct SessionState {
     /// `docuzent_core::vram`. Kept alongside the session so `/model-info`
     /// can report it without a second round-trip to Ollama.
     vram_estimate: vram::ModelVramEstimate,
+    /// The exact paths behind the last successful `/load` call - so
+    /// "save this as a workspace" (see `workspaces.rs`) has something
+    /// real to record, since `Session` itself only keeps base file names
+    /// (`source_files`), not full paths.
+    last_loaded_paths: Vec<PathBuf>,
+    last_loaded_text_only: bool,
 }
 
 /// An *estimated* ingestion-progress snapshot, set right before a
@@ -113,6 +122,7 @@ struct AppState {
     host: String,
     cache_path: PathBuf,
     docling_cache_path: PathBuf,
+    workspaces: WorkspaceManager,
 }
 
 /// Waits for a free slot in `gate`, returning the held permit alongside
@@ -160,7 +170,16 @@ fn open_session_state(
     std::fs::create_dir_all(&upload_dir).ok();
 
     let session = Session::open(OllamaClient::new(host, model, context_length), model, context_length, upload_dir, mode, map_reduce_context_fraction, cache, docling_cache)?;
-    Ok(SessionState { session, model: model.to_string(), mode_label: mode_label.to_string(), context_length, map_reduce_context_fraction, vram_estimate })
+    Ok(SessionState {
+        session,
+        model: model.to_string(),
+        mode_label: mode_label.to_string(),
+        context_length,
+        map_reduce_context_fraction,
+        vram_estimate,
+        last_loaded_paths: Vec::new(),
+        last_loaded_text_only: false,
+    })
 }
 
 #[tokio::main]
@@ -179,6 +198,7 @@ async fn main() -> Result<()> {
         host: cli.host.clone(),
         cache_path: cli.cache.clone(),
         docling_cache_path: cli.docling_cache.clone(),
+        workspaces: WorkspaceManager::new(cli.cache.parent().unwrap_or(std::path::Path::new(".docuzent-cache")).join("workspaces.json")),
     });
 
     let app = Router::new()
@@ -191,6 +211,9 @@ async fn main() -> Result<()> {
         .route("/ask", post(ask_handler))
         .route("/ask-stream", post(ask_stream_handler))
         .route("/progress", get(progress_handler))
+        .route("/workspaces", get(list_workspaces_handler).post(save_workspace_handler))
+        .route("/workspaces/load", post(load_workspace_handler))
+        .route("/workspaces/delete", post(delete_workspace_handler))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state);
 
@@ -565,7 +588,12 @@ async fn load_handler(
             let Some(session_state) = guard.as_mut() else {
                 anyhow::bail!("session is switching models right now - try again in a moment");
             };
-            if text_only { session_state.session.load_text_files(&dests) } else { session_state.session.load_documents(&dests) }
+            let result = if text_only { session_state.session.load_text_files(&dests) } else { session_state.session.load_documents(&dests) };
+            if result.is_ok() {
+                session_state.last_loaded_paths = dests;
+                session_state.last_loaded_text_only = text_only;
+            }
+            result
         }
     })
     .await;
@@ -792,6 +820,145 @@ fn sanitize_filename(name: &str) -> String {
         "upload".to_string()
     } else {
         base.to_string()
+    }
+}
+
+#[derive(Serialize)]
+struct WorkspacesResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspaces: Option<std::collections::BTreeMap<String, workspaces::Workspace>>,
+}
+
+async fn list_workspaces_handler(State(state): State<std::sync::Arc<AppState>>) -> impl IntoResponse {
+    match state.workspaces.list() {
+        Ok(ws) => (StatusCode::OK, Json(WorkspacesResponse { ok: true, error: None, workspaces: Some(ws) })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WorkspacesResponse { ok: false, error: Some(e.to_string()), workspaces: None })),
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveWorkspaceRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct SimpleResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Saves whichever files were loaded by the *last successful* `/load`
+/// call, along with the currently active model/mode/context length, as
+/// a named workspace - a thin record over what already exists (see
+/// `workspaces.rs`), not a copy of the document content itself.
+async fn save_workspace_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<SaveWorkspaceRequest>) -> impl IntoResponse {
+    let Some(name) = workspaces::sanitize_name(&req.name) else {
+        return (StatusCode::BAD_REQUEST, Json(SimpleResponse { ok: false, error: Some("workspace name is empty or invalid".to_string()) }));
+    };
+    let guard = state.state.lock().unwrap();
+    let Some(session_state) = guard.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(SimpleResponse { ok: false, error: Some("session is switching models right now".to_string()) }));
+    };
+    if session_state.last_loaded_paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(SimpleResponse { ok: false, error: Some("load a document first, then save it as a workspace".to_string()) }));
+    }
+    let workspace = workspaces::Workspace {
+        paths: session_state.last_loaded_paths.iter().map(|p| p.display().to_string()).collect(),
+        text_only: session_state.last_loaded_text_only,
+        model: session_state.model.clone(),
+        mode: session_state.mode_label.clone(),
+        context_length: session_state.context_length,
+        map_reduce_context_fraction: session_state.map_reduce_context_fraction,
+        updated_at: chrono_now_rfc3339(),
+    };
+    drop(guard);
+    match state.workspaces.save_workspace(&name, workspace) {
+        Ok(()) => (StatusCode::OK, Json(SimpleResponse { ok: true, error: None })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(SimpleResponse { ok: false, error: Some(e.to_string()) })),
+    }
+}
+
+/// A minimal RFC 3339 timestamp without pulling in a `chrono`/`time`
+/// dependency just for this - good enough for "when was this last
+/// saved," which is display-only, never parsed back for logic.
+fn chrono_now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    format!("unix:{secs}")
+}
+
+#[derive(Deserialize)]
+struct LoadWorkspaceRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct LoadWorkspaceResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fits_in_one_chunk: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_from_disk: Option<bool>,
+}
+
+/// Reloads a saved workspace's files into the *currently active* session
+/// - deliberately does not also switch model/mode (that stays a
+/// separate, explicit `POST /model` call), keeping this a thin reload,
+/// not a hidden model switch. If the on-disk context cache still has
+/// this exact document (likely, since nothing evicts it on a timer),
+/// this is a real cache hit, not just upload convenience.
+async fn load_workspace_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<LoadWorkspaceRequest>) -> impl IntoResponse {
+    let workspace = match state.workspaces.get(&req.name) {
+        Ok(Some(w)) => w,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(LoadWorkspaceResponse { ok: false, error: Some(format!("no workspace named `{}`", req.name)), chars: None, fits_in_one_chunk: None, warm_from_disk: None })),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(LoadWorkspaceResponse { ok: false, error: Some(e.to_string()), chars: None, fits_in_one_chunk: None, warm_from_disk: None })),
+    };
+    let paths: Vec<PathBuf> = workspace.paths.iter().map(PathBuf::from).collect();
+    let missing: Vec<&PathBuf> = paths.iter().filter(|p| !p.exists()).collect();
+    if !missing.is_empty() {
+        let names = missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+        return (
+            StatusCode::GONE,
+            Json(LoadWorkspaceResponse { ok: false, error: Some(format!("workspace file(s) no longer exist: {names} - they may have been cleared from the upload temp directory")), chars: None, fits_in_one_chunk: None, warm_from_disk: None }),
+        );
+    }
+
+    let result = tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || {
+            let mut guard = state.state.lock().unwrap();
+            let Some(session_state) = guard.as_mut() else {
+                anyhow::bail!("session is switching models right now - try again in a moment");
+            };
+            let result = if workspace.text_only { session_state.session.load_text_files(&paths) } else { session_state.session.load_documents(&paths) };
+            if result.is_ok() {
+                session_state.last_loaded_paths = paths;
+                session_state.last_loaded_text_only = workspace.text_only;
+            }
+            result
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => (StatusCode::OK, Json(LoadWorkspaceResponse { ok: true, error: None, chars: Some(report.chars), fits_in_one_chunk: Some(report.fits_in_one_chunk), warm_from_disk: Some(report.warm_from_disk) })),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(LoadWorkspaceResponse { ok: false, error: Some(e.to_string()), chars: None, fits_in_one_chunk: None, warm_from_disk: None })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(LoadWorkspaceResponse { ok: false, error: Some(e.to_string()), chars: None, fits_in_one_chunk: None, warm_from_disk: None })),
+    }
+}
+
+async fn delete_workspace_handler(State(state): State<std::sync::Arc<AppState>>, Json(req): Json<LoadWorkspaceRequest>) -> impl IntoResponse {
+    match state.workspaces.delete(&req.name) {
+        Ok(true) => (StatusCode::OK, Json(SimpleResponse { ok: true, error: None })),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(SimpleResponse { ok: false, error: Some(format!("no workspace named `{}`", req.name)) })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(SimpleResponse { ok: false, error: Some(e.to_string()) })),
     }
 }
 

@@ -221,6 +221,12 @@ Now: a `tokio::sync::Semaphore`-based admission gate (`--max-concurrent-requests
 
 ---
 
+## Persisted, named workspaces (web UI)
+
+The web UI's session was fully ephemeral before this - closing the tab or switching documents meant re-uploading from scratch, even though the on-disk context cache would likely still have that exact document warm. `docuzent-web` now has a small local `workspaces.json` (`docuzent_web::workspaces`) recording, per named workspace, which files to reload plus the model/mode/context length that were active when it was saved. Loading a workspace re-runs the normal `/load` path against those same files - a real cache hit whenever the disk cache still has it, not a special case - deliberately without also auto-switching model/mode, keeping it a thin reload rather than a hidden model switch. See [issue #38](https://github.com/no-mans-code/docuzent/issues/38).
+
+---
+
 ## Answer citations: which part of the document an answer actually came from
 
 Every `AnswerReport` (CLI, web UI, `docuzent-mcp`) now includes `source_files` - the real file names in the loaded corpus, so an answer never leaves you guessing what it was based on, even on the single-chunk path where no finer-grained locator exists.
