@@ -1,0 +1,121 @@
+{
+ "book": "The Subtle Art of Not Giving a F*ck",
+ "expected_title": "The Subtle Art of Not Giving a F*ck",
+ "questions": [
+  {
+   "q": "What is written on Charles Bukowski's tombstone?",
+   "must": [
+    "Don.t try"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Who is Disappointment Panda, and what is his superpower?",
+   "any_of": [
+    "harsh truth"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Where was Hiroo Onoda deployed, and in which year did he return to Japan?",
+   "must": [
+    "Lubang"
+   ],
+   "any_of": [
+    "1974"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Where did Hiroo Onoda move after returning to Japan?",
+   "must": [
+    "Brazil"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What band did Dave Mustaine form after he was kicked out, and how many albums did it sell?",
+   "must": [
+    "Megadeth"
+   ],
+   "any_of": [
+    "25 million",
+    "twenty-five million"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Why did Dave Mustaine still consider himself a failure?",
+   "must": [
+    "Metallica"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Who replaced Pete Best in the Beatles?",
+   "must": [
+    "Ringo"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What is Manson's law of avoidance?",
+   "any_of": [
+    "threatens your identity",
+    "more you.{0,20}avoid"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What is the 'backwards law' Alan Watts described?",
+   "any_of": [
+    "more you pursue",
+    "less satisf",
+    "backwards"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What did the Polish psychologist Kazimierz Dabrowski study?",
+   "any_of": [
+    "World War",
+    "survivors"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What was Ernest Becker's book, and what did it win?",
+   "must": [
+    "Denial of Death"
+   ],
+   "any_of": [
+    "Pulitzer"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "How old was the author when his friend Josh took him to the party on the lake, and near which city was it?",
+   "must": [
+    "nineteen|19"
+   ],
+   "any_of": [
+    "Dallas"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What is the name of the author's wife?",
+   "must": [
+    "Fernanda"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What is the name of Mark Manson's dog?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "set": "held-out"
+  }
+ ]
+}

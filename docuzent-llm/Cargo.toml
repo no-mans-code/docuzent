@@ -1,0 +1,11 @@
+[package]
+name = "docuzent-llm"
+version = "0.2.0"
+edition = "2021"
+description = "Language-model engines: llama.cpp (with real KV-cache slot save/restore), Ollama (any model), a simulated engine for tests - and text embeddings."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

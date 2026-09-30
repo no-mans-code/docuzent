@@ -1,0 +1,226 @@
+{
+ "book": "Harry Potter and the Philosopher's Stone",
+ "expected_title": "Harry Potter and the Philosopher's Stone",
+ "questions": [
+  {
+   "set": "tuning",
+   "q": "How many points did Gryffindor and Slytherin have at the end of the year, and what decided the House Cup?",
+   "must": [
+    "Neville"
+   ],
+   "any_of": [
+    "482",
+    "eighty-two"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "How did the four houses stand at the final feast, and what changed in the last minutes? Give the points.",
+   "must": [
+    "472|four hundred and seventy-two"
+   ],
+   "any_of": [
+    "Neville",
+    "482"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "What is the name of Hagrid's mother, and how did she die?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "never": [
+    "half-giant|Fridwulfa|giantess",
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "What is the name of Dumbledore's brother?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "never": [
+    "Aberforth",
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "What obstacles guarded the Philosopher's Stone, in order?",
+   "must": [
+    "Fluffy",
+    "[Ss]nare",
+    "chess"
+   ],
+   "any_of": [
+    "key"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "How old is Nicolas Flamel?",
+   "any_of": [
+    "665",
+    "six hundred and sixty-five",
+    "sixty-fifth"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "What wand did Harry get, and what is special about it?",
+   "must": [
+    "holly",
+    "phoenix"
+   ],
+   "any_of": [
+    "brother",
+    "another wand",
+    "Voldemort",
+    "scar"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "tuning",
+   "q": "What position does Harry play in Quidditch, and why was he chosen?",
+   "must": [
+    "Seeker"
+   ],
+   "any_of": [
+    "caught",
+    "snatched",
+    "Remembrall",
+    "dived",
+    "flying",
+    "catch"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "Which vault did Hagrid visit for Dumbledore at Gringotts, and what did he take from it?",
+   "must": [
+    "seven hundred and thirteen|713"
+   ],
+   "any_of": [
+    "package",
+    "parcel"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "What does Dumbledore say he sees in the Mirror of Erised?",
+   "must": [
+    "sock"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "How many birthday presents did Dudley get, and why was he upset?",
+   "must": [
+    "thirty-six|36"
+   ],
+   "any_of": [
+    "thirty-seven",
+    "37",
+    "last year"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "What did the note that came with the Invisibility Cloak say?",
+   "must": [
+    "father left this"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "Why was Hagrid expelled from Hogwarts, and in which year?",
+   "must": [
+    "third"
+   ],
+   "never": [
+    "Chamber|Riddle|Aragog|Acromantula",
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "What spell was the class practising when Ron kept getting it wrong, and what did Hermione tell him?",
+   "must": [
+    "Wingardium Leviosa"
+   ],
+   "any_of": [
+    "wrong",
+    "Levi-?o-?sa"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "What is the name of Snape's mother?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "never": [
+    "Eileen|Prince",
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "What did Hagrid name his dragon, and what breed was it?",
+   "must": [
+    "Norbert"
+   ],
+   "any_of": [
+    "Ridgeback"
+   ],
+   "never": [
+    "\\bteach(es|ing)?\\b|core idea|the book'?s (lesson|values)|what matters most"
+   ]
+  },
+  {
+   "set": "held-out",
+   "q": "Where did Hagrid get Fluffy from?",
+   "must": [
+    "Greek"
+   ],
+   "any_of": [
+    "pub"
+   ]
+  }
+ ]
+}
