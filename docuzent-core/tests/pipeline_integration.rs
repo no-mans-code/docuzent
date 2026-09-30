@@ -25,6 +25,7 @@ fn unique_temp_dir(label: &str) -> TempDir {
 }
 
 #[test]
+#[ignore = "needs Docling, a local Ollama with nomic-embed-text and the personal fixtures in temp-test/ (not in the repository): cargo test -- --ignored"]
 fn ingest_then_reingest_unchanged_is_stable() {
     let source_dir = unique_temp_dir("source");
     let work_dir = unique_temp_dir("work");

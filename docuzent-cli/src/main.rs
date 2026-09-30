@@ -105,6 +105,42 @@ enum Command {
         #[arg(long, default_value = "What is this document about?")]
         question: String,
     },
+    /// Ask a long document (a book) a question in one of the four reading modes - RAG, expanded RAG, RAG pointing at
+    /// saved KV parts, or saved KV parts only (see docs/READING_MODES.md). Needs a llama.cpp server for the modes
+    /// that save KV states; what it learns (saved parts, indexes) is kept and reused.
+    Read {
+        /// The document
+        file: PathBuf,
+        /// The question
+        question: String,
+        /// rag, rag-expanded, rag-kv or kv
+        #[arg(long, default_value = "rag-kv")]
+        mode: String,
+        /// Cut the index where the model says scenes and topics change (default: at paragraphs)
+        #[arg(long)]
+        guided: bool,
+        /// A llama.cpp server (it saves KV states - needed for rag-kv, kv and expansions)
+        #[arg(long, default_value = "http://localhost:8081")]
+        llm_url: String,
+        /// Use an Ollama server instead (no saved KV states)
+        #[arg(long)]
+        ollama_url: Option<String>,
+        #[arg(long, default_value = "qwen3:14b")]
+        ollama_model: String,
+        /// The llama.cpp server's --slot-save-path
+        #[arg(long, default_value = ".docuzent-kv")]
+        kv_dir: PathBuf,
+        #[arg(long, default_value_t = 40)]
+        kv_budget_gb: u64,
+        /// An OpenAI-compatible embeddings endpoint (Ollama, or llama.cpp --embeddings); none = search by words only
+        #[arg(long)]
+        embed_url: Option<String>,
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
+        /// Where indexes are kept
+        #[arg(long, default_value = ".docuzent-read")]
+        work: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -116,7 +152,80 @@ fn main() -> Result<()> {
             run_ask(files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question, text_only)
         }
         Command::Bench { file, model, host, question } => run_bench(file, model, host, question),
+        Command::Read { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work } => {
+            run_read(ReadArgs { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work })
+        }
     }
+}
+
+struct ReadArgs {
+    file: PathBuf,
+    question: String,
+    mode: String,
+    guided: bool,
+    llm_url: String,
+    ollama_url: Option<String>,
+    ollama_model: String,
+    kv_dir: PathBuf,
+    kv_budget_gb: u64,
+    embed_url: Option<String>,
+    embed_model: String,
+    work: PathBuf,
+}
+
+fn run_read(a: ReadArgs) -> Result<()> {
+    use std::sync::Arc;
+
+    use docuzent_doc::kvpool::KvPool;
+    use docuzent_llm::{Embedder, Engine, LlamaServer, OllamaServer, OpenAiEmbedder};
+    use docuzent_read::{answer, read, Chunking, Document, Mode as ReadMode, ReadOptions, Shelf, Sources};
+
+    let mode = ReadMode::parse(&a.mode)?;
+    let (engine, model): (Arc<dyn Engine>, String) = match &a.ollama_url {
+        Some(url) => (Arc::new(OllamaServer::connect(url, &a.ollama_model, 12288)?), a.ollama_model.clone()),
+        None => {
+            let s = LlamaServer::connect(&a.llm_url)?;
+            let name = s.model_path().rsplit(['/', '\\']).next().unwrap_or("model").to_string();
+            (Arc::new(s), name)
+        }
+    };
+    // a scope of its own, so this never touches another app's saved states in a shared directory
+    let model_id = format!("dz-{}", model.chars().filter(|c| c.is_ascii_alphanumeric()).take(9).collect::<String>().to_lowercase());
+    let store = Arc::new(docuzent_kv::KvStore::open_scoped(&a.kv_dir, a.kv_budget_gb << 30, Some("dz"))?);
+    let pool = KvPool::new(engine.clone(), store);
+    let embedder = a.embed_url.as_deref().map(|u| OpenAiEmbedder::new(u, &a.embed_model));
+
+    let book = docuzent_doc::extract::extract_book(&a.file, None)?;
+    let named = pool.with_scratch(|llm| docuzent_doc::title::detect(llm, &a.file.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(), &book.text))?;
+    eprintln!("{}{} - {} characters", named.title, named.author.as_ref().map(|x| format!(" by {x}")).unwrap_or_default(), book.text.len());
+    let doc = Document::from_text(&book.text, &named.title, named.author.as_deref(), &model_id, &|t| engine.count_tokens(t))?;
+    let chunking = if a.guided { Chunking::Guided } else { Chunking::Plain };
+    if mode.needs_saved_parts() || mode.needs_expansions() || a.guided {
+        let saved = doc.save_parts(&pool, &mut |i, n| if n > 0 { eprint!("\rsaving part {} of {n}   ", i + 1) })?;
+        if saved > 0 {
+            eprintln!();
+        }
+    }
+    let index = if mode.needs_index() {
+        Some(doc.index(&pool, &a.work.join(&doc.id), chunking, mode.needs_expansions(), &model_id, embedder.as_ref().map(|e| e as &dyn Embedder), &mut |s| eprintln!("{s} ..."))?)
+    } else {
+        None
+    };
+    let started = std::time::Instant::now();
+    let reading = read(
+        mode,
+        Sources { pool: &pool, corpus: &doc, indexes: index.iter().map(|ix| Shelf { index: ix, first_part: 0 }).collect(), embedder: embedder.as_ref().map(|e| e as &dyn Embedder) },
+        &a.question,
+        ReadOptions::default(),
+        &|s| eprintln!("  {s}"),
+    )?;
+    let reply = pool.with_scratch(|llm| answer::answer(llm, &a.question, &reading.passages))?;
+    println!("{reply}\n");
+    for p in &reading.passages {
+        println!("[part {}] {}", p.part, p.text.chars().take(300).collect::<String>().replace('\n', " "));
+    }
+    eprintln!("\n{} - {:.1} s ({} passages, {} parts read closely, {} chunks found)", mode.label(), started.elapsed().as_secs_f64(), reading.passages.len(), reading.read_closely, reading.retrieved);
+    Ok(())
 }
 
 fn run_ingest(

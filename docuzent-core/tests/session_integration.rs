@@ -30,6 +30,7 @@ const MODEL: &str = "qwen2.5:3b";
 const HOST: &str = "http://localhost:11434";
 
 #[test]
+#[ignore = "needs Docling and a local Ollama with the model pulled: cargo test -- --ignored"]
 fn context_persists_to_disk_across_a_fresh_session() {
     let db_path = temp_path("persist");
     let docling_path = temp_docling_path("persist");

@@ -12,3 +12,7 @@ docuzent-core = { path = "../docuzent-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 kvcache = { git = "https://github.com/no-mans-code/kvcache" }
+docuzent-llm = { path = "../docuzent-llm" }
+docuzent-kv = { path = "../docuzent-kv" }
+docuzent-doc = { path = "../docuzent-doc" }
+docuzent-read = { path = "../docuzent-read" }

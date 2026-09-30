@@ -48,15 +48,10 @@ fn read_text_lossy(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// The file name, tidied (see [`crate::title::clean_file_title`]): the title until the document's own first pages
+/// are read (`crate::title::detect`).
 fn title_from_filename(path: &Path) -> String {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
-    let cleaned = stem.replace(['_', '-'], " ");
-    let cleaned = cleaned.trim();
-    let mut chars = cleaned.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => "Untitled".to_string(),
-    }
+    crate::title::clean_file_title(&path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
 // ---- plain text -----------------------------------------------------------
@@ -502,7 +497,7 @@ body text
 
     #[test]
     fn filename_becomes_a_readable_title() {
-        assert_eq!(title_from_filename(Path::new("/x/the_song-celestial.txt")), "The song celestial");
+        assert_eq!(title_from_filename(Path::new("/x/the_song-celestial.txt")), "The Song Celestial");
     }
 
     #[test]
