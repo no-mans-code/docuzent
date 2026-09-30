@@ -24,12 +24,11 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use docuzent_doc::kvpool::KvPool;
-use docuzent_doc::parts::{split_into_parts, Part, PART_TOKEN_LIMIT};
 use docuzent_doc::{hash, title};
-use docuzent_kv::{file_name, KvStore};
+use docuzent_kv::KvStore;
 use docuzent_llm::{Embedder, Engine, LlamaServer, OllamaServer, OpenAiEmbedder};
 use docuzent_read::expand::{expand, guided_index};
-use docuzent_read::{answer, read, Chunking, Corpus, Index, Mode, ReadOptions, Sources};
+use docuzent_read::{answer, read, Chunking, Corpus, Document, Index, Mode, ReadOptions, Sources};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +133,10 @@ struct QuestionResult {
 #[derive(Serialize)]
 struct RunSummary {
     run: String,
+    /// The model's plain generation speed (tokens/s) before and after the run: a run where it fell is one whose
+    /// timings something else on the machine was eating into.
+    speed_before: f64,
+    speed_after: f64,
     mode: String,
     passed: usize,
     total: usize,
@@ -158,31 +161,13 @@ struct Report {
     questions: Vec<QuestionResult>,
 }
 
-struct EvalCorpus {
-    title: String,
-    owner: String,
-    parts: Vec<(String, Part)>,
-}
-
-impl Corpus for EvalCorpus {
-    fn part_count(&self) -> usize {
-        self.parts.len()
-    }
-    fn part_file(&self, i: usize) -> &str {
-        &self.parts[i].0
-    }
-    fn part_owner(&self, _i: usize) -> &str {
-        &self.owner
-    }
-    fn part_prefix(&self, i: usize) -> String {
-        self.parts[i].1.prefix(&self.title, None, self.parts.len())
-    }
-    fn part_text(&self, i: usize) -> &str {
-        &self.parts[i].1.text
-    }
-    fn title(&self) -> &str {
-        &self.title
-    }
+/// Plain generation speed, tokens per second: 64 tokens of nothing in particular.
+fn speed(pool: &KvPool) -> f64 {
+    pool.with_scratch(|llm| {
+        let c = llm.complete(&docuzent_llm::chatml::ask("", "Count slowly from one upwards, in words."), &docuzent_llm::Sampling::precise(64), &mut |_| {})?;
+        Ok(if c.gen_ms > 0.0 { c.gen_tokens as f64 / (c.gen_ms / 1000.0) } else { 0.0 })
+    })
+    .unwrap_or(0.0)
 }
 
 fn secs(t: Instant) -> f64 {
@@ -240,8 +225,7 @@ fn main() -> Result<()> {
     let detected = pool.with_scratch(|llm| title::detect(llm, &file_name_for_title, &text)).ok();
     eprintln!("[eval] {} - {} chars; title read as {:?}", set.book, text.len(), detected.as_ref().map(|t| (&t.title, &t.author)));
 
-    let parts = split_into_parts(&text, PART_TOKEN_LIMIT, &|s| engine.count_tokens(s))?;
-    let corpus = EvalCorpus { title: set.book.clone(), owner: doc_id.clone(), parts: parts.into_iter().map(|p| (file_name(&model_id, &doc_id, &p.kv_kind()), p)).collect() };
+    let corpus = Document::from_text(&text, &set.book, None, &model_id, &|s| engine.count_tokens(s))?;
     eprintln!("[eval] {} parts", corpus.part_count());
 
     let learned_path = work.join(format!("learned-{model_id}.json"));
@@ -277,7 +261,7 @@ fn main() -> Result<()> {
             let t = Instant::now();
             for (n, i) in missing.iter().enumerate() {
                 eprintln!("[eval] saving part {} of {} ({} to go)", i + 1, corpus.part_count(), missing.len() - n);
-                pool.prime(corpus.part_file(*i), &corpus.owner, &corpus.part_prefix(*i))?;
+                pool.prime(corpus.part_file(*i), &corpus.id, &corpus.part_prefix(*i))?;
             }
             if missing.len() == corpus.part_count() {
                 learned.kv_s = Some(secs(t));
@@ -332,6 +316,7 @@ fn main() -> Result<()> {
         let chunk_s = if *chunking == Chunking::Guided { learned.index_guided_s.unwrap_or(0.0) } else { learned.index_plain_s.unwrap_or(0.0) };
         let kv_s = if mode.needs_saved_parts() || *expanded || *chunking == Chunking::Guided { learned.kv_s.unwrap_or(0.0) } else { 0.0 };
         let learn_s = kv_s + if mode.needs_index() { chunk_s + if *expanded { learned.expand_s.unwrap_or(0.0) } else { 0.0 } + learned.embed_s.get(&key).copied().unwrap_or(0.0) } else { 0.0 };
+        let speed_before = speed(&pool);
         let (mut passed, mut total, mut ho_p, mut ho_t, mut times) = (0, 0, 0, 0, Vec::new());
         for (n, q) in set.questions.iter().enumerate() {
             if only.as_ref().is_some_and(|o| !o.contains(&(n + 1))) {
@@ -358,8 +343,9 @@ fn main() -> Result<()> {
         }
         let avg = if times.is_empty() { 0.0 } else { times.iter().sum::<f64>() / times.len() as f64 };
         let max = times.iter().cloned().fold(0.0, f64::max);
-        eprintln!("[eval] {name}: {passed}/{total} (held out {ho_p}/{ho_t}), {avg:.0}s average");
-        summaries.push(RunSummary { run: name.clone(), mode: mode.as_str().into(), passed, total, held_out_passed: ho_p, held_out_total: ho_t, avg_s: avg, max_s: max, learn_s });
+        let speed_after = speed(&pool);
+        eprintln!("[eval] {name}: {passed}/{total} (held out {ho_p}/{ho_t}), {avg:.0}s average; model at {speed_before:.0} -> {speed_after:.0} tokens/s");
+        summaries.push(RunSummary { run: name.clone(), speed_before, speed_after, mode: mode.as_str().into(), passed, total, held_out_passed: ho_p, held_out_total: ho_t, avg_s: avg, max_s: max, learn_s });
     }
 
     let report = Report { book: set.book.clone(), expected_title: set.expected_title.clone(), detected_title: detected, chars: text.len(), parts: corpus.part_count(), model, embedder: embed_id, learned: learned.clone(), runs: summaries, questions: results };
@@ -379,9 +365,10 @@ fn markdown(r: &Report) -> String {
     if let Some(t) = &r.detected_title {
         s.push_str(&format!("Title read from the first pages: **{}**{} (from the {}){}.\n", t.title, t.author.as_ref().map(|a| format!(" by {a}")).unwrap_or_default(), t.source, r.expected_title.as_ref().map(|e| format!("; expected \"{e}\"")).unwrap_or_default()));
     }
-    s.push_str("\n| mode | accuracy | held out | seconds / question (avg, worst) | learning (s) |\n|---|---|---|---|---|\n");
+    s.push_str("\n| mode | accuracy | held out | seconds / question (avg, worst) | learning (s) | model speed (tokens/s, before -> after) |\n|---|---|---|---|---|---|\n");
     for run in &r.runs {
-        s.push_str(&format!("| {} | {}/{} | {}/{} | {:.0}, {:.0} | {:.0} |\n", run.run, run.passed, run.total, run.held_out_passed, run.held_out_total, run.avg_s, run.max_s, run.learn_s));
+        let suspect = run.speed_after < run.speed_before * 0.6 || run.speed_before < 20.0;
+        s.push_str(&format!("| {} | {}/{} | {}/{} | {:.0}, {:.0} | {:.0} | {:.0} -> {:.0}{} |\n", run.run, run.passed, run.total, run.held_out_passed, run.held_out_total, run.avg_s, run.max_s, run.learn_s, run.speed_before, run.speed_after, if suspect { " (timings suspect)" } else { "" }));
     }
     let l = &r.learned;
     s.push_str(&format!(

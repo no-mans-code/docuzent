@@ -68,9 +68,9 @@ pub fn clean_file_title(file_name: &str) -> String {
     let spaced: String = s.chars().map(|c| if c == '_' || c == '+' { ' ' } else { c }).collect();
     // "vdoc.pub" and friends before splitting on dashes and dots
     let mut words: Vec<String> = spaced.split_whitespace().flat_map(|w| if w.contains("vdoc.pub") || w.contains("dokumen.pub") { vec![w.replace("vdoc.pub", " ").replace("dokumen.pub", " ")] } else { vec![w.to_string()] }).flat_map(|w| w.split_whitespace().map(str::to_string).collect::<Vec<_>>()).collect();
-    // a word joined by hyphens is kept ("Bhagavad-Gita") unless the whole name was hyphen-separated
-    let hyphenated = words.len() <= 2 && words.iter().any(|w| w.matches('-').count() >= 2);
-    if hyphenated {
+    // a name written without spaces uses hyphens as spaces too ("the_song-celestial", "50-successful-essays"); one
+    // written with spaces keeps its hyphenated words ("The Song Celestial (Bhagavad-Gita)")
+    if !decoded.contains(' ') {
         words = words.iter().flat_map(|w| w.split('-').map(str::to_string).collect::<Vec<_>>()).collect();
     }
     let kept: Vec<String> = words.into_iter().map(|w| w.trim_matches(|c: char| c == '-' || c == '.').to_string()).filter(|w| !w.is_empty() && !is_junk(w)).collect();
@@ -196,7 +196,8 @@ mod tests {
             ("Harry Potter and The Philosopher's Stone (SDoc).pdf", "Harry Potter and The Philosopher's Stone"),
             ("vdoc.pub_50-successful-ivy-league-application-essays.pdf", "50 Successful Ivy League Application Essays"),
             ("0-The art of not giving a damn.pdf", "The art of not giving a damn"),
-            ("FRANKL_Viktor_Man's_Search_For_Meaning-1963_text.pdf", "FRANKL Viktor Man's Search For Meaning-1963"),
+            ("FRANKL_Viktor_Man's_Search_For_Meaning-1963_text.pdf", "FRANKL Viktor Man's Search For Meaning 1963"),
+            ("the_song-celestial.txt", "The Song Celestial"),
             ("Talking with Psychopaths and Savages PDF.pdf", "Talking with Psychopaths and Savages"),
             ("gita.txt", "Gita"),
             ("01 - Nineteen Eighty-Four.epub", "Nineteen Eighty-Four"),

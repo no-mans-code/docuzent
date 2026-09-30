@@ -15,7 +15,7 @@ BOOK="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 SET="$2"
 RUNS="${3:-rag,rag:guided,rag-expanded,rag-kv,rag-kv:expanded,kv}"
 shift 3 2>/dev/null || shift $#
-docker run --rm \
+docker run --rm --label docuzent-eval=1 \
   --network "${EVAL_NETWORK:-thebook_default}" \
   --add-host host.docker.internal:host-gateway \
   -v "${EVAL_KV_VOLUME:-thebook_thebook-kv}:/kv" \

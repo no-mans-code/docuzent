@@ -421,6 +421,10 @@ dependencies = [
  "anyhow",
  "clap",
  "docuzent-core",
+ "docuzent-doc",
+ "docuzent-kv",
+ "docuzent-llm",
+ "docuzent-read",
  "kvcache",
 ]
 
