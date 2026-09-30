@@ -1,0 +1,10 @@
+[package]
+name = "docuzent-kv"
+version = "0.2.0"
+edition = "2021"
+description = "The size-bounded, least-recently-used store of saved KV-cache files a model server writes."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

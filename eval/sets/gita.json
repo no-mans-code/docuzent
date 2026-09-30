@@ -1,0 +1,113 @@
+{
+ "book": "The Song Celestial (Bhagavad-Gita)",
+ "expected_title": "The Song Celestial",
+ "questions": [
+  {
+   "q": "Who describes the battle to the blind king, and who is the king?",
+   "must": [
+    "Sanjaya"
+   ],
+   "any_of": [
+    "Dhrit[ia]rashtra"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Where is the battle about to take place?",
+   "must": [
+    "Kurukshetra"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What slips from Arjuna's hand when he sees his kinsmen ranged for battle?",
+   "any_of": [
+    "Gandiv",
+    "bow"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What was Krishna's conch carved from?",
+   "must": [
+    "Giant.s bone"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What was Yudhisthira's conch called?",
+   "must": [
+    "Victory.s Voice"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "To whom does Duryodhana speak at the start of the battle, and what does he call him?",
+   "must": [
+    "Drona"
+   ],
+   "any_of": [
+    "Guru"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What does Krishna say about whether the spirit is born or can die?",
+   "any_of": [
+    "never.{0,20}born",
+    "birthless",
+    "deathless",
+    "cannot slay",
+    "not slain"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "When Krishna shows Arjuna his true form, what is its radiance likened to?",
+   "must": [
+    "thousand suns"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "What are the three qualities of Nature called?",
+   "must": [
+    "Sattwa",
+    "Rajas",
+    "Tamas"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "According to the preface, which part of the Mahabharata does the poem come from?",
+   "any_of": [
+    "Bhishma",
+    "sixth"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "Who wins the war at Kurukshetra?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "never": [
+    "Pandavas (won|win|were victorious|prevail)",
+    "victory of the Pandavas",
+    "Kauravas (lost|were defeated)"
+   ],
+   "set": "held-out"
+  },
+  {
+   "q": "How many days did the battle of Kurukshetra last?",
+   "any_of": [
+    "not (say|name|tell|mention|give|state)|does not|doesn.t|no (mention|passage)|isn.t (said|mentioned|stated)"
+   ],
+   "never": [
+    "eighteen",
+    "18 days"
+   ],
+   "set": "held-out"
+  }
+ ]
+}

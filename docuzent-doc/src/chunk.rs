@@ -82,7 +82,7 @@ fn chunk_texts(texts: &[DoclingText], max_chars: usize) -> Vec<ChunkInput> {
 /// this at all - it exists only for the rare page whose text overruns the
 /// cap on its own. `pub(crate)` since [`crate::session`] reuses it for
 /// plain-text map-reduce splitting, not just page-sized chunking.
-pub(crate) fn split_to_max(text: &str, max_chars: usize) -> Vec<String> {
+pub fn split_to_max(text: &str, max_chars: usize) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
         return vec![text.trim().to_string()];

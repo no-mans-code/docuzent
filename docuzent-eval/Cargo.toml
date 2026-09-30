@@ -1,0 +1,16 @@
+[package]
+name = "docuzent-eval"
+version = "0.2.0"
+edition = "2021"
+description = "Measures the four reading modes on a real book: accuracy, seconds per question, learning time and disk."
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+docuzent-llm = { path = "../docuzent-llm" }
+docuzent-kv = { path = "../docuzent-kv" }
+docuzent-doc = { path = "../docuzent-doc" }
+docuzent-read = { path = "../docuzent-read" }
