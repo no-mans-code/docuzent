@@ -140,6 +140,12 @@ enum Command {
         /// Where indexes are kept
         #[arg(long, default_value = ".docuzent-read")]
         work: PathBuf,
+        /// Let the answer reason and use knowledge beyond the document (it says which is which)
+        #[arg(long)]
+        offleash: bool,
+        /// Reason before answering: auto (counting questions, and off the leash), always or never
+        #[arg(long, default_value = "auto")]
+        think: String,
     },
 }
 
@@ -152,8 +158,8 @@ fn main() -> Result<()> {
             run_ask(files, model, host, mode, context_length, map_reduce_context_fraction, cache, docling_cache, question, text_only)
         }
         Command::Bench { file, model, host, question } => run_bench(file, model, host, question),
-        Command::Read { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work } => {
-            run_read(ReadArgs { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work })
+        Command::Read { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work, offleash, think } => {
+            run_read(ReadArgs { file, question, mode, guided, llm_url, ollama_url, ollama_model, kv_dir, kv_budget_gb, embed_url, embed_model, work, offleash, think })
         }
     }
 }
@@ -171,6 +177,8 @@ struct ReadArgs {
     embed_url: Option<String>,
     embed_model: String,
     work: PathBuf,
+    offleash: bool,
+    think: String,
 }
 
 fn run_read(a: ReadArgs) -> Result<()> {
@@ -178,9 +186,10 @@ fn run_read(a: ReadArgs) -> Result<()> {
 
     use docuzent_doc::kvpool::KvPool;
     use docuzent_llm::{Embedder, Engine, LlamaServer, OllamaServer, OpenAiEmbedder};
-    use docuzent_read::{answer, read, Chunking, Document, Mode as ReadMode, ReadOptions, Shelf, Sources};
+    use docuzent_read::{answer, check_context, read, Chunking, Document, Mode as ReadMode, ReadOptions, Shelf, Sources};
 
     let mode = ReadMode::parse(&a.mode)?;
+    let think = docuzent_read::Think::parse(&a.think)?;
     let (engine, model): (Arc<dyn Engine>, String) = match &a.ollama_url {
         Some(url) => (Arc::new(OllamaServer::connect(url, &a.ollama_model, 12288)?), a.ollama_model.clone()),
         None => {
@@ -189,8 +198,10 @@ fn run_read(a: ReadArgs) -> Result<()> {
             (Arc::new(s), name)
         }
     };
-    // a scope of its own, so this never touches another app's saved states in a shared directory
-    let model_id = format!("dz-{}", model.chars().filter(|c| c.is_ascii_alphanumeric()).take(9).collect::<String>().to_lowercase());
+    check_context(&model, engine.context_size())?;
+    // a scope of its own, so this never touches another app's saved states in a shared directory; the model's whole
+    // name, so two models that start alike (qwen3:0.6b, qwen2.5:3b) never share them
+    let model_id = format!("dz-{}", model.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase());
     let store = Arc::new(docuzent_kv::KvStore::open_scoped(&a.kv_dir, a.kv_budget_gb << 30, Some("dz"))?);
     let pool = KvPool::new(engine.clone(), store);
     let embedder = a.embed_url.as_deref().map(|u| OpenAiEmbedder::new(u, &a.embed_model));
@@ -219,7 +230,7 @@ fn run_read(a: ReadArgs) -> Result<()> {
         ReadOptions::default(),
         &|s| eprintln!("  {s}"),
     )?;
-    let reply = pool.with_scratch(|llm| answer::answer(llm, &a.question, &reading.passages))?;
+    let reply = pool.with_scratch(|llm| answer::answer_with(llm, &a.question, &reading.passages, a.offleash, think))?;
     println!("{reply}\n");
     for p in &reading.passages {
         println!("[part {}] {}", p.part, p.text.chars().take(300).collect::<String>().replace('\n', " "));

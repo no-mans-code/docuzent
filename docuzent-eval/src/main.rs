@@ -28,7 +28,7 @@ use docuzent_doc::{hash, title};
 use docuzent_kv::KvStore;
 use docuzent_llm::{Embedder, Engine, LlamaServer, OllamaServer, OpenAiEmbedder};
 use docuzent_read::expand::{expand, guided_index};
-use docuzent_read::{answer, read, Chunking, Corpus, Document, Index, Mode, ReadOptions, Sources};
+use docuzent_read::{answer, check_context, read, Think, Chunking, Corpus, Document, Index, Mode, ReadOptions, Sources};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -128,7 +128,8 @@ struct Learned {
     index_bytes: std::collections::BTreeMap<String, u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct QuestionResult {
     run: String,
     n: usize,
@@ -144,7 +145,8 @@ struct QuestionResult {
     chunks_retrieved: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct RunSummary {
     run: String,
     /// The model's plain generation speed (tokens/s) before and after the run: a run where it fell is one whose
@@ -161,7 +163,8 @@ struct RunSummary {
     learn_s: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct Report {
     book: String,
     expected_title: Option<String>,
@@ -226,7 +229,12 @@ fn main() -> Result<()> {
             (Arc::new(s), name)
         }
     };
-    let model_id = format!("{}-{}", cli.scope, model.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<String>().to_lowercase());
+    check_context(&model, engine.context_size())?;
+    eprintln!("[eval] model {model}: a {}-token window", engine.context_size());
+    // What saved states and indexes are filed under. An Ollama model's whole name - its first letters alone would
+    // file qwen3:0.6b and qwen2.5:3b together; a weights file keeps the short id its saved states already have.
+    let short: String = model.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+    let model_id = if cli.ollama_url.is_some() { format!("{}-{short}", cli.scope) } else { format!("{}-{}", cli.scope, &short[..short.len().min(8)]) };
     let store = Arc::new(KvStore::open_scoped(&cli.kv_dir, cli.kv_budget_gb << 30, Some(&cli.scope))?);
     let pool = KvPool::new(engine.clone(), store.clone());
     let embedder: Option<Box<dyn Embedder>> = cli.embed_url.as_deref().map(|u| Box::new(OpenAiEmbedder::new(u, &cli.embed_model)) as Box<dyn Embedder>);
@@ -248,8 +256,8 @@ fn main() -> Result<()> {
     let mut learned: Learned = std::fs::read(&learned_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let save_learned = |l: &Learned| std::fs::write(&learned_path, serde_json::to_vec_pretty(l).unwrap());
 
-    // mode[:guided][:expanded][:offleash]
-    let runs: Vec<(Mode, Chunking, bool, bool, String)> = cli
+    // mode[:guided][:expanded][:offleash][:think|:nothink]
+    let runs: Vec<(Mode, Chunking, bool, bool, Think, String)> = cli
         .runs
         .split(',')
         .map(|r| {
@@ -259,6 +267,7 @@ fn main() -> Result<()> {
             let chunking = if rest.contains(&"guided") { Chunking::Guided } else { Chunking::Plain };
             let expanded = mode.needs_expansions() || rest.contains(&"expanded");
             let offleash = rest.contains(&"offleash");
+            let think = if rest.contains(&"think") { Think::Always } else if rest.contains(&"nothink") { Think::Never } else { Think::Auto };
             let mut name = mode.as_str().to_string();
             if chunking == Chunking::Guided {
                 name.push_str(" (guided chunks)");
@@ -269,12 +278,17 @@ fn main() -> Result<()> {
             if offleash {
                 name.push_str(" (off-leash)");
             }
-            Ok((mode, chunking, expanded, offleash, name))
+            match think {
+                Think::Always => name.push_str(" (always reasons)"),
+                Think::Never => name.push_str(" (never reasons)"),
+                Think::Auto => {}
+            }
+            Ok((mode, chunking, expanded, offleash, think, name))
         })
         .collect::<Result<_>>()?;
 
     // saved parts: every run that needs them, and guided chunking and expansions (which read each part resident)
-    let need_kv = runs.iter().any(|(m, c, x, _, _)| m.needs_saved_parts() || *x || *c == Chunking::Guided);
+    let need_kv = runs.iter().any(|(m, c, x, _, _, _)| m.needs_saved_parts() || *x || *c == Chunking::Guided);
     if need_kv {
         let missing: Vec<usize> = (0..corpus.part_count()).filter(|i| !store.contains(corpus.part_file(*i))).collect();
         if !missing.is_empty() {
@@ -327,7 +341,7 @@ fn main() -> Result<()> {
 
     let mut results: Vec<QuestionResult> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::new();
-    for (mode, chunking, expanded, offleash, name) in &runs {
+    for (mode, chunking, expanded, offleash, think, name) in &runs {
         let index = if mode.needs_index() { Some(index_for(*chunking, *expanded, &mut learned)?) } else { None };
         save_learned(&learned)?;
         // what learning the book takes for this run: chunking (guided needs the model; plain is instant), expansions,
@@ -346,7 +360,7 @@ fn main() -> Result<()> {
             let reading = read(*mode, Sources { pool: &pool, corpus: &corpus, indexes: index.as_ref().map(|i| vec![docuzent_read::Shelf { index: i, first_part: 0 }]).unwrap_or_default(), embedder: embedder.as_deref() }, &q.q, ReadOptions::default(), &|_| {})?;
             let read_s = secs(t);
             let ta = Instant::now();
-            let ans = pool.with_scratch(|llm| answer::answer_leash(llm, &q.q, &reading.passages, *offleash))?;
+            let ans = pool.with_scratch(|llm| answer::answer_with(llm, &q.q, &reading.passages, *offleash, *think))?;
             let answer_s = secs(ta);
             let seconds = secs(t);
             let problems = check(q, &ans, *offleash);
@@ -368,15 +382,30 @@ fn main() -> Result<()> {
         summaries.push(RunSummary { run: name.clone(), speed_before, speed_after, mode: mode.as_str().into(), passed, total, held_out_passed: ho_p, held_out_total: ho_t, avg_s: avg, max_s: max, learn_s });
     }
 
-    let report = Report { book: set.book.clone(), expected_title: set.expected_title.clone(), detected_title: detected, chars: text.len(), parts: corpus.part_count(), model, embedder: embed_id, learned: learned.clone(), runs: summaries, questions: results };
+    let mut report = Report { book: set.book.clone(), expected_title: set.expected_title.clone(), detected_title: detected, chars: text.len(), parts: corpus.part_count(), model, embedder: embed_id, learned: learned.clone(), runs: summaries, questions: results };
     std::fs::create_dir_all(&cli.out)?;
-    let slug: String = set.book.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>().split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    // One report per book and model: a later evaluation of some of the runs replaces those runs and keeps the rest.
+    let slug = format!("{}--{}", slugify(&set.book), slugify(report.model.trim_end_matches(".gguf")));
     let json_path = cli.out.join(format!("{slug}.json"));
+    if let Ok(bytes) = std::fs::read(&json_path) {
+        let earlier: Report = serde_json::from_slice(&bytes).with_context(|| format!("{} is not a report - move it aside", json_path.display()))?;
+        let fresh: Vec<String> = report.runs.iter().map(|r| r.run.clone()).collect();
+        let mut runs: Vec<RunSummary> = earlier.runs.into_iter().filter(|r| !fresh.contains(&r.run)).collect();
+        runs.append(&mut report.runs);
+        let mut questions: Vec<QuestionResult> = earlier.questions.into_iter().filter(|q| !fresh.contains(&q.run)).collect();
+        questions.append(&mut report.questions);
+        report.runs = runs;
+        report.questions = questions;
+    }
     std::fs::write(&json_path, serde_json::to_vec_pretty(&report)?)?;
     std::fs::write(cli.out.join(format!("{slug}.md")), markdown(&report))?;
     println!("{}", markdown(&report));
     eprintln!("[eval] written to {}", json_path.display());
     Ok(())
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect::<String>().split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-")
 }
 
 fn markdown(r: &Report) -> String {
