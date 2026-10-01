@@ -193,7 +193,19 @@ fn secs(t: Instant) -> f64 {
     t.elapsed().as_secs_f64()
 }
 
+/// An answer as text: the LaTeX a model writes maths in (`4 \, \text{s}`, `$v$`) reduced to what it says (`4 s`,
+/// `v`), so a pattern for a number and its unit matches however the answer typeset it (eval/rescore.py: `plain`).
+fn plain(answer: &str) -> String {
+    let markup = regex::Regex::new(r"\\(?:text|mathrm|mathbf|textbf|mbox|operatorname)\{([^{}]*)\}").unwrap();
+    let a = markup.replace_all(answer, "$1");
+    let a = regex::Regex::new(r"\\[,;:! ]").unwrap().replace_all(&a, " ");
+    let a = regex::Regex::new(r"\\(?:times|cdot)").unwrap().replace_all(&a, "×");
+    let a = a.replace('$', "");
+    regex::Regex::new(r"[ \t]+").unwrap().replace_all(&a, " ").into_owned()
+}
+
 fn check(q: &Question, answer: &str, offleash: bool) -> Vec<String> {
+    let answer = &plain(answer);
     let re = |p: &str| RegexBuilder::new(p).case_insensitive(true).build();
     let own = Check { must: q.must.clone(), any_of: q.any_of.clone(), never: q.never.clone() };
     let q = if offleash { q.offleash.as_ref().unwrap_or(&own) } else { &own };
@@ -454,4 +466,17 @@ fn markdown(r: &Report) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_typeset_in_latex_is_checked_for_what_it_says() {
+        let q = Question { q: "How long does it fall?".into(), must: vec!["40".into()], any_of: vec![r"\b4 ?s\b".into()], never: Vec::new(), set: "held-out".into(), offleash: None };
+        assert!(check(&q, r"$t = 4 \, \text{s}$ and $v = 40 \, \mathrm{m/s}$", false).is_empty());
+        assert!(!check(&q, "t = 14 s, v = 140 m/s", false).is_empty(), "a wrong number is still wrong");
+        assert_eq!(plain(r"$2 \times 10^{9} \; \text{N}$"), "2 × 10^{9} N");
+    }
 }

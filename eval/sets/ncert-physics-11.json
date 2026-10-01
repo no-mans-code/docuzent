@@ -122,8 +122,7 @@
    "q": "What is the length of a simple pendulum which ticks seconds?",
    "must": [],
    "any_of": [
-    "\\b1 ?m\\b",
-    "1\\.0 ?m",
+    "\\b1(\\.0)? ?(m|metres?|meters?)\\b",
     "about 1",
     "one met",
     "0\\.99"
