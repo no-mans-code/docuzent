@@ -23,7 +23,9 @@ use crate::index::{cut_at, Chunking, Entry, EntryKind, Index, CHUNK_CHARS};
 
 /// Chunks described in one call: enough to amortise the call, few enough that the reply stays well-formed.
 pub const EXPAND_BATCH: usize = 3;
-const EXPAND_TOKENS: i32 = 1100;
+/// Room for three passages' descriptions. A reply cut off at this limit loses only the passage it was writing (what
+/// it finished is kept), and that passage is described again on its own.
+const EXPAND_TOKENS: i32 = 1600;
 const CUT_TOKENS: i32 = 300;
 
 pub fn cut_prompt() -> String {
@@ -95,7 +97,8 @@ fn text_of(v: &Value) -> String {
 /// The expansion entries a reply describes, for the chunks `ids` (in the order they were numbered). A reply that is
 /// not JSON, or leaves a passage out, gives fewer entries - never wrong ones.
 pub fn parse_expansions(reply: &str, ids: &[usize], chunk_texts: &[&str]) -> Vec<Entry> {
-    let items: Vec<Value> = json::first_array(reply).and_then(|a| serde_json::from_str(a).ok()).unwrap_or_default();
+    // the whole array - or, from a reply cut off mid-way (or otherwise broken), every object it did finish
+    let items: Vec<Value> = json::first_array(reply).and_then(|a| serde_json::from_str(a).ok()).unwrap_or_else(|| json::complete_objects(reply).into_iter().filter_map(|o| serde_json::from_str(o).ok()).collect());
     let mut out = Vec::new();
     for (pos, item) in items.iter().enumerate() {
         let n = item["n"].as_u64().map(|n| n as usize).filter(|n| (1..=ids.len()).contains(n)).unwrap_or(pos + 1);
@@ -116,25 +119,49 @@ pub fn parse_expansions(reply: &str, ids: &[usize], chunk_texts: &[&str]) -> Vec
 
 /// Mode 2: every chunk described by the model (with its part resident), the descriptions added to the index as
 /// entries pointing back to the chunk. `model` is recorded, so a change of model is known to call for a rebuild.
-pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str, on_progress: &mut dyn FnMut(usize, usize)) -> Result<()> {
-    let total = index.chunks.len();
-    let mut entries = Vec::new();
+///
+/// A chunk the batch reply left out (cut off at its token limit, or not JSON) is described again on its own. On an
+/// index this model already expanded, only the chunks without descriptions are described - a repair, not a rebuild.
+/// Returns how many chunks are still undescribed (0 when every one is).
+pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str, on_progress: &mut dyn FnMut(usize, usize)) -> Result<usize> {
+    let repair = index.made_by.as_deref() == Some(model) && index.has_expansions();
+    let todo: Vec<usize> = if repair { index.unexpanded() } else { (0..index.chunks.len()).collect() };
+    let mut entries: Vec<Entry> = if repair { index.entries.iter().filter(|e| e.kind.is_expansion()).cloned().collect() } else { Vec::new() };
+    let total = todo.len();
     let mut done = 0;
+    let mut left_out = 0;
     for part in 0..corpus.part_count() {
-        let ids: Vec<usize> = index.chunks.iter().filter(|c| c.part == part).map(|c| c.id).collect();
+        let ids: Vec<usize> = todo.iter().copied().filter(|c| index.chunks[*c].part == part).collect();
+        if ids.is_empty() {
+            continue;
+        }
         let prefix = corpus.part_prefix(part);
-        for batch in ids.chunks(EXPAND_BATCH) {
-            on_progress(done, total);
+        let describe = |batch: &[usize]| -> Result<Vec<Entry>> {
             let texts: Vec<&str> = batch.iter().map(|id| index.chunks[*id].text.as_str()).collect();
             let prompt = chatml::ask(&prefix, &expand_prompt(&texts));
             let (c, _) = pool.with_resident(corpus.part_file(part), corpus.part_owner(part), &prefix, |llm| llm.complete(&prompt, &Sampling::precise(EXPAND_TOKENS), &mut |_| {}))?;
-            entries.extend(parse_expansions(&c.text, batch, &texts));
+            Ok(parse_expansions(&c.text, batch, &texts))
+        };
+        for batch in ids.chunks(EXPAND_BATCH) {
+            on_progress(done, total);
+            let got = describe(batch)?;
+            let missing: Vec<usize> = batch.iter().copied().filter(|id| !got.iter().any(|e| e.chunk == *id)).collect();
+            entries.extend(got);
+            if batch.len() > 1 {
+                for id in missing {
+                    let alone = describe(&[id])?;
+                    left_out += alone.is_empty() as usize;
+                    entries.extend(alone);
+                }
+            } else {
+                left_out += missing.len();
+            }
             done += batch.len();
         }
     }
     on_progress(total, total);
     index.add_expansions(entries, model);
-    Ok(())
+    Ok(left_out)
 }
 
 #[cfg(test)]
@@ -158,6 +185,13 @@ mod tests {
         assert_eq!(kinds, vec![(7, EntryKind::Context), (7, EntryKind::People), (7, EntryKind::Setting), (7, EntryKind::Facts), (7, EntryKind::Questions), (8, EntryKind::People)]);
         assert!(e[0].text.starts_with("At the Dursleys' breakfast.") && e[0].text.ends_with("chunk seven"), "context entries carry the chunk itself");
         assert!(parse_expansions("not json", &[1], &["x"]).is_empty());
+    }
+
+    #[test]
+    fn a_reply_cut_off_mid_way_keeps_the_passages_it_finished() {
+        let cut = r#"[{"n": 1, "context": "At the zoo.", "people": "Harry", "setting": "", "facts": [], "questions": []}, {"n": 2, "context": "On the train, wh"#;
+        let e = parse_expansions(cut, &[4, 5], &["four", "five"]);
+        assert!(!e.is_empty() && e.iter().all(|x| x.chunk == 4), "passage 1 kept, the unfinished passage 2 not invented");
     }
 
     #[test]

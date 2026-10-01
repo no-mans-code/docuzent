@@ -190,6 +190,12 @@ impl Index {
     }
 
     /// Adds expansion entries (Mode 2), made by `model`.
+    /// The chunks no expansion describes (in an index with expansions: the ones whose description failed).
+    pub fn unexpanded(&self) -> Vec<usize> {
+        let described: std::collections::HashSet<usize> = self.entries.iter().filter(|e| e.kind.is_expansion()).map(|e| e.chunk).collect();
+        (0..self.chunks.len()).filter(|c| !described.contains(c)).collect()
+    }
+
     pub fn add_expansions(&mut self, entries: Vec<Entry>, model: &str) {
         self.entries.retain(|e| !e.kind.is_expansion());
         self.entries.extend(entries.into_iter().filter(|e| e.kind.is_expansion() && e.chunk < self.chunks.len() && !e.text.trim().is_empty()));

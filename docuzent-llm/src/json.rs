@@ -43,6 +43,19 @@ pub fn first_array(s: &str) -> Option<&str> {
     first_balanced(s, '[', ']')
 }
 
+/// Every complete `{...}` in `s`, in order - what can be saved from an array the model was cut off writing (its
+/// token limit reached mid-way): the objects it finished, without the one it did not.
+pub fn complete_objects(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(o) = first_object(rest) {
+        out.push(o);
+        let end = o.as_ptr() as usize - rest.as_ptr() as usize + o.len();
+        rest = &rest[end..];
+    }
+    out
+}
+
 /// A list field the model may have written as an array, one string, or with
 /// junk in it: always a clean `Vec<String>`.
 pub fn string_list(v: &serde_json::Value) -> Vec<String> {
@@ -64,6 +77,14 @@ pub fn string_list(v: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_finished_objects_of_a_cut_off_array_are_kept() {
+        let cut = r#"[{"n": 1, "facts": ["a {brace} in a string"]}, {"n": 2, "x": {"y": 1}}, {"n": 3, "context": "the model ran out of to"#;
+        assert_eq!(first_array(cut), None);
+        assert_eq!(complete_objects(cut), vec![r#"{"n": 1, "facts": ["a {brace} in a string"]}"#, r#"{"n": 2, "x": {"y": 1}}"#]);
+        assert!(complete_objects("no json here").is_empty());
+    }
 
     #[test]
     fn finds_json_inside_prose_and_fences() {

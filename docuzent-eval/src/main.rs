@@ -310,8 +310,21 @@ fn main() -> Result<()> {
     let index_for = |chunking: Chunking, expanded: bool, learned: &mut Learned| -> Result<Index> {
         let key = format!("{}{}", if chunking == Chunking::Guided { "guided" } else { "plain" }, if expanded { "-expanded" } else { "" });
         let dir = work.join(format!("index-{key}-{model_id}"));
-        if let Some(ix) = Index::load(&dir)? {
+        if let Some(mut ix) = Index::load(&dir)? {
             if ix.embed_model == embed_id {
+                let missing = ix.unexpanded().len();
+                if !(expanded && ix.made_by.as_deref() == Some(model_id.as_str()) && missing > 0) {
+                    return Ok(ix);
+                }
+                // an index from before expansions were retried: describe only the chunks it is missing
+                let t = Instant::now();
+                eprintln!("[eval] {missing} of {} chunks have no expansions - describing them", ix.chunks.len());
+                let left = expand(&pool, &corpus, &mut ix, &model_id, &mut |_, _| {})?;
+                if let Some(e) = embedder.as_deref() {
+                    ix.embed(e, &mut |_, _| {})?;
+                }
+                ix.save(&dir)?;
+                eprintln!("[eval] repaired in {:.0}s; {left} chunks still without expansions", secs(t));
                 return Ok(ix);
             }
         }
@@ -326,7 +339,8 @@ fn main() -> Result<()> {
         }
         if expanded {
             let t = Instant::now();
-            expand(&pool, &corpus, &mut ix, &model_id, &mut |i, n| if i % 10 == 0 { eprintln!("[eval] expanding chunk {i} of {n}") })?;
+            let left = expand(&pool, &corpus, &mut ix, &model_id, &mut |i, n| if i % 10 == 0 { eprintln!("[eval] expanding chunk {i} of {n}") })?;
+            eprintln!("[eval] expanded; {left} of {} chunks without expansions", ix.chunks.len());
             learned.expand_s = Some(secs(t));
         }
         if let Some(e) = embedder.as_deref() {
