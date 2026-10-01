@@ -389,6 +389,10 @@ fn main() -> Result<()> {
             }
             times.push(seconds);
             eprintln!("[eval] {name} #{} {} ({seconds:.0}s) {}", n + 1, if pass { "PASS" } else { "FAIL" }, q.q);
+            if !pass {
+                // what went wrong, in the log already (the report is written only when every run is done)
+                eprintln!("[eval]    {} | {}", problems.join("; "), ans.replace('\n', " ").chars().take(400).collect::<String>());
+            }
             results.push(QuestionResult { run: name.clone(), n: n + 1, set: q.set.clone(), question: q.q.clone(), pass, problems, answer: ans, seconds, read_s, answer_s, parts_read: reading.read_closely + reading.scores.len(), chunks_retrieved: reading.retrieved });
         }
         let avg = if times.is_empty() { 0.0 } else { times.iter().sum::<f64>() / times.len() as f64 };
