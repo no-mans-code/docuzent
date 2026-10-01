@@ -57,7 +57,9 @@ struct Cli {
     kv_dir: PathBuf,
     #[arg(long, default_value = "eval")]
     scope: String,
-    #[arg(long, default_value_t = 40)]
+    /// The evaluation's share of the KV store (least recently used first out; an evicted part is re-read in a
+    /// second or two when needed). Small, so the disk it shares with everything else never fills.
+    #[arg(long, default_value_t = 20)]
     kv_budget_gb: u64,
     /// An OpenAI-compatible embeddings endpoint (Ollama, or llama.cpp with --embeddings); none = words only
     #[arg(long)]
