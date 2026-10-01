@@ -84,6 +84,38 @@ Use only this part of the book. Inside the JSON, quote anyone's words with singl
     p
 }
 
+/// [`expand_prompt`] for a small window, where a call may write only a few hundred tokens: a sentence of context and
+/// two questions per passage - what fits, rather than a full description cut off before its first field closes.
+pub fn expand_prompt_compact(passages: &[&str]) -> String {
+    let mut p = String::from(
+        "Below are passages from this part of the book, numbered. For each one, write a short JSON object: \"context\" - one sentence: who is there, where, and what is happening; \"questions\" - two short questions it answers. Use only this part of the book; quote anyone's words with single quotes. Reply with the JSON array only, nothing before or after: [{\"n\": 1, \"context\": \"...\", \"questions\": [\"...\", \"...\"]}]\n\n",
+    );
+    for (i, t) in passages.iter().enumerate() {
+        p.push_str(&format!("[{}]\n{}\n\n", i + 1, t));
+    }
+    p
+}
+
+/// The string value of `"key": "..."` in `reply`, if it was finished (a reply cut off later still gave it).
+fn finished_string(reply: &str, key: &str) -> Option<String> {
+    let at = reply.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = reply[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in rest.chars() {
+        match (escaped, c) {
+            (true, c) => {
+                out.push(c);
+                escaped = false;
+            }
+            (false, '\\') => escaped = true,
+            (false, '"') => return Some(out).filter(|s| !s.trim().is_empty()),
+            (false, c) => out.push(c),
+        }
+    }
+    None
+}
+
 fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.trim().to_string(),
@@ -98,7 +130,13 @@ fn text_of(v: &Value) -> String {
 /// not JSON, or leaves a passage out, gives fewer entries - never wrong ones.
 pub fn parse_expansions(reply: &str, ids: &[usize], chunk_texts: &[&str]) -> Vec<Entry> {
     // the whole array - or, from a reply cut off mid-way (or otherwise broken), every object it did finish
-    let items: Vec<Value> = json::first_array(reply).and_then(|a| serde_json::from_str(a).ok()).unwrap_or_else(|| json::complete_objects(reply).into_iter().filter_map(|o| serde_json::from_str(o).ok()).collect());
+    let mut items: Vec<Value> = json::first_array(reply).and_then(|a| serde_json::from_str(a).ok()).unwrap_or_else(|| json::complete_objects(reply).into_iter().filter_map(|o| serde_json::from_str(o).ok()).collect());
+    // one passage, its description cut off before the object closed: keep the context sentence it did finish
+    if items.is_empty() && ids.len() == 1 {
+        if let Some(context) = finished_string(reply, "context") {
+            items.push(serde_json::json!({ "n": 1, "context": context }));
+        }
+    }
     let mut out = Vec::new();
     for (pos, item) in items.iter().enumerate() {
         let n = item["n"].as_u64().map(|n| n as usize).filter(|n| (1..=ids.len()).contains(n)).unwrap_or(pos + 1);
@@ -141,7 +179,8 @@ pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str
         let prefix = corpus.part_prefix(part);
         let describe = |batch: &[usize]| -> Result<Vec<Entry>> {
             let texts: Vec<&str> = batch.iter().map(|id| index.chunks[*id].text.as_str()).collect();
-            let prompt = chatml::ask(&prefix, &expand_prompt(&texts));
+            // a call that may write only a few hundred tokens asks for what fits
+            let prompt = chatml::ask(&prefix, &if b.expand_tokens < 600 { expand_prompt_compact(&texts) } else { expand_prompt(&texts) });
             let (c, _) = pool.with_resident(corpus.part_file(part), corpus.part_owner(part), &prefix, |llm| llm.complete(&prompt, &Sampling::precise(b.expand_tokens), &mut |_| {}))?;
             Ok(parse_expansions(&c.text, batch, &texts))
         };
@@ -195,6 +234,18 @@ mod tests {
         assert_eq!(kinds, vec![(7, EntryKind::Context), (7, EntryKind::People), (7, EntryKind::Setting), (7, EntryKind::Facts), (7, EntryKind::Questions), (8, EntryKind::People)]);
         assert!(e[0].text.starts_with("At the Dursleys' breakfast.") && e[0].text.ends_with("chunk seven"), "context entries carry the chunk itself");
         assert!(parse_expansions("not json", &[1], &["x"]).is_empty());
+    }
+
+    /// What qwen3:0.6b wrote in a 1,024-token window: one passage, the object cut off at its token limit before it
+    /// closed. The context sentence it finished is kept.
+    #[test]
+    fn one_passage_cut_off_before_its_object_closed_keeps_the_context_it_finished() {
+        let cut = "```json\n[\n  {\n    \"n\": 1,\n    \"context\": \"The spirit is described as untouched, self-sustained, and indestructible.\",\n    \"people\": [\n      {\n        \"name\": \"the spirit\",\n        \"do\": \"being unto";
+        let e = parse_expansions(cut, &[7], &["the passage"]);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].chunk == 7 && e[0].kind == EntryKind::Context && e[0].text.starts_with("The spirit is described as untouched"));
+        assert!(parse_expansions("\"context\": \"never clo", &[7], &["x"]).is_empty(), "an unfinished sentence is not kept");
+        assert!(expand_prompt_compact(&["a"]).contains("two short questions") && !expand_prompt_compact(&["a"]).contains("\"setting\""));
     }
 
     #[test]
