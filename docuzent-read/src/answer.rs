@@ -5,8 +5,9 @@
 //! with the names, numbers and order the passages give; work out any counting before stating it; say in a sentence
 //! when the passages do not say something, and stop - never guess or bring in outside knowledge.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use docuzent_llm::{chatml, Llm, Sampling};
+use serde::{Deserialize, Serialize};
 
 use crate::reader::{passages_block, Passage};
 use crate::text::needs_thinking;
@@ -19,6 +20,50 @@ const THINK_TOKENS: i32 = 1800;
 
 /// Off the leash: the document first, then reasoning and knowledge from beyond it - always said to be so.
 pub const OFFLEASH_RULE: &str = "The person has taken you OFF THE LEASH for this answer: the rule to use only the document is lifted. Start from what the passages say and build on it: reason step by step, work numbers through, and use what you know from beyond the document where it is not enough. Say plainly which parts come from the document and which are your own reasoning or knowledge (\"the document says...\", \"beyond the document...\"). If the document is a story and what you know goes further into it than the passages do, say so before you say it.";
+
+/// When an answer is reasoned through before it is written. Reasoning only happens on a model that can
+/// ([`Llm::can_think`]: Ollama's `thinking` capability, or a `<think>` chat template); on any other, every setting
+/// answers straight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Think {
+    /// Counting, comparing and ordering questions ([`needs_thinking`]), and every answer off the leash.
+    #[default]
+    Auto,
+    /// Every answer: slower, for hard questions the detector does not see (a numerical worded as a story).
+    Always,
+    /// None, not even off the leash: the fastest, for a model whose reasoning wanders.
+    Never,
+}
+
+impl Think {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "auto" | "" => Think::Auto,
+            "always" | "on" | "think" => Think::Always,
+            "never" | "off" | "nothink" => Think::Never,
+            other => bail!("unknown thinking setting `{other}` - auto, always or never"),
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Think::Auto => "auto",
+            Think::Always => "always",
+            Think::Never => "never",
+        }
+    }
+
+    /// Whether an answer to `question` (off the leash or not) is reasoned through, on a model that `can_think`.
+    pub fn wants(self, question: &str, offleash: bool, can_think: bool) -> bool {
+        can_think
+            && match self {
+                Think::Auto => needs_thinking(question) || offleash,
+                Think::Always => true,
+                Think::Never => false,
+            }
+    }
+}
 
 pub fn answer_prompt(question: &str, passages: &[Passage]) -> String {
     answer_prompt_leash(question, passages, false)
@@ -43,8 +88,13 @@ pub fn answer(llm: &dyn Llm, question: &str, passages: &[Passage]) -> Result<Str
 
 /// [`answer`], on the leash or off it (off the leash, every answer is reasoned through first).
 pub fn answer_leash(llm: &dyn Llm, question: &str, passages: &[Passage], offleash: bool) -> Result<String> {
+    answer_with(llm, question, passages, offleash, Think::Auto)
+}
+
+/// [`answer_leash`], reasoning through first as `think` says.
+pub fn answer_with(llm: &dyn Llm, question: &str, passages: &[Passage], offleash: bool, think: Think) -> Result<String> {
     let prompt = answer_prompt_leash(question, passages, offleash);
-    if (needs_thinking(question) || offleash) && llm.can_think() {
+    if think.wants(question, offleash, llm.can_think()) {
         let c = llm.complete(&format!("{}{}", chatml::user(&prompt), chatml::assistant_open_thinking()), &Sampling::thinking(ANSWER_TOKENS + THINK_TOKENS), &mut |_| {})?;
         if let Some(i) = c.text.find("</think>") {
             return Ok(c.text[i + "</think>".len()..].trim().to_string());
@@ -70,5 +120,18 @@ mod tests {
         let e = SimEngine::new(12288, |p| if p.ends_with("<|im_start|>assistant\n") { "<think>472 + 10 = 482</think>\n\nGryffindor: 482.".into() } else { "straight".into() });
         assert_eq!(answer(&e, "How many points did Gryffindor have?", &[]).unwrap(), "Gryffindor: 482.");
         assert_eq!(answer(&e, "Who is Hagrid?", &[]).unwrap(), "straight");
+    }
+
+    #[test]
+    fn thinking_can_be_asked_for_always_or_never_and_only_happens_on_a_model_that_can() {
+        let e = SimEngine::new(12288, |p| if p.ends_with("<|im_start|>assistant\n") { "<think>v = gt = 40</think>\n\n40 m/s.".into() } else { "straight".into() });
+        let q = "A stone falls for 4 s. What speed does it reach?";
+        assert_eq!(answer_with(&e, q, &[], false, Think::Auto).unwrap(), "straight", "auto: not a counting question");
+        assert_eq!(answer_with(&e, q, &[], false, Think::Always).unwrap(), "40 m/s.");
+        assert_eq!(answer_with(&e, "How many points?", &[], true, Think::Never).unwrap(), "straight", "never, even off the leash");
+        assert!(Think::Auto.wants("Who is Hagrid?", true, true) && !Think::Always.wants("x", false, false), "off the leash reasons on auto; a model that cannot, never does");
+        assert_eq!((Think::parse("always").unwrap(), Think::parse("off").unwrap(), Think::parse("").unwrap()), (Think::Always, Think::Never, Think::Auto));
+        assert!(Think::parse("maybe").is_err());
+        assert_eq!(serde_json::to_string(&Think::Always).unwrap(), "\"always\"");
     }
 }
