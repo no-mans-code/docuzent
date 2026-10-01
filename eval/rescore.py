@@ -8,7 +8,19 @@ import re
 import sys
 
 
+def plain(answer):
+    """An answer as text: LaTeX markup a model writes maths in (`4 \\, \\text{s}`, `$v$`) reduced to what it says
+    (`4 s`, `v`), so a pattern for a number and its unit matches however the answer typeset it. The evaluator does
+    the same (docuzent-eval, `plain`)."""
+    a = re.sub(r"\\(?:text|mathrm|mathbf|textbf|mbox|operatorname)\{([^{}]*)\}", r"\1", answer)
+    a = re.sub(r"\\[,;:! ]", " ", a)
+    a = re.sub(r"\\(?:times|cdot)", "×", a)
+    a = a.replace("$", "")
+    return re.sub(r"[ \t]+", " ", a)
+
+
 def check(q, answer):
+    answer = plain(answer)
     problems = []
     for p in q.get("must", []):
         if not re.search(p, answer, re.I):
@@ -56,4 +68,5 @@ def main():
     print(f"{changed} grade(s) changed")
 
 
-main()
+if __name__ == "__main__":
+    main()
