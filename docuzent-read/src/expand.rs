@@ -76,7 +76,7 @@ pub fn expand_prompt(passages: &[&str]) -> String {
 - \"setting\": the place, the time, and the objects, creatures and events it involves\n\
 - \"facts\": the facts it states, each short, with names and numbers exactly as written\n\
 - \"questions\": three questions a reader could ask that it answers\n\
-Use only this part of the book. Reply with a JSON array, one object per passage, in order: [{\"n\": 1, \"context\": \"...\", \"people\": \"...\", \"setting\": \"...\", \"facts\": [\"...\"], \"questions\": [\"...\"]}]\n\n",
+Use only this part of the book. Inside the JSON, quote anyone's words with single quotes ('like this'), never double quotes. Reply with a JSON array, one object per passage, in order: [{\"n\": 1, \"context\": \"...\", \"people\": \"...\", \"setting\": \"...\", \"facts\": [\"...\"], \"questions\": [\"...\"]}]\n\n",
     );
     for (i, t) in passages.iter().enumerate() {
         p.push_str(&format!("[{}]\n{}\n\n", i + 1, t));
@@ -129,7 +129,8 @@ pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str
     let mut entries: Vec<Entry> = if repair { index.entries.iter().filter(|e| e.kind.is_expansion()).cloned().collect() } else { Vec::new() };
     let total = todo.len();
     let mut done = 0;
-    let mut left_out = 0;
+    // described alone and still not: kept by their own text, not tried again on every load
+    let mut failed_alone: Vec<usize> = Vec::new();
     for part in 0..corpus.part_count() {
         let ids: Vec<usize> = todo.iter().copied().filter(|c| index.chunks[*c].part == part).collect();
         if ids.is_empty() {
@@ -150,16 +151,23 @@ pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str
             if batch.len() > 1 {
                 for id in missing {
                     let alone = describe(&[id])?;
-                    left_out += alone.is_empty() as usize;
+                    if alone.is_empty() {
+                        failed_alone.push(id);
+                    }
                     entries.extend(alone);
                 }
             } else {
-                left_out += missing.len();
+                failed_alone.extend(missing);
             }
             done += batch.len();
         }
     }
     on_progress(total, total);
+    let left_out = failed_alone.len();
+    if !repair {
+        index.undescribable.clear();
+    }
+    index.undescribable.extend(failed_alone);
     index.add_expansions(entries, model);
     Ok(left_out)
 }
