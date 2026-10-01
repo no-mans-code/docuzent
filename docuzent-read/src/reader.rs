@@ -246,12 +246,17 @@ fn score_parts(pool: &KvPool, corpus: &dyn Corpus, query: &str, on_stage: &dyn F
 /// second half is read again. Parts in `strong` (scored high) that yield nothing are asked for their closest lines.
 pub fn read_parts(pool: &KvPool, corpus: &dyn Corpus, query: &str, chosen: &[usize], strong: &[usize], opts: ReadOptions, on_stage: &dyn Fn(&str), out: &mut Reading) -> Result<()> {
     let context = opts.context;
+    // what a close reading may write, for this model's window (700 tokens at 12,288)
+    let b = crate::Budget::for_engine(pool.engine().context_size());
+    let leaf = b.leaf_tokens;
+    // the second look replays the first reading: only where the window holds the part, both readings and the asking
+    let second_look = b.part_tokens + 2 * leaf as usize + 400 <= b.context;
     for (n, i) in chosen.iter().enumerate() {
         on_stage(&format!("Looking closely at part {} ({} of {})", i + 1, n + 1, chosen.len()));
         let file = corpus.part_file(*i);
         let owner = corpus.part_owner(*i);
         let prefix = corpus.part_prefix(*i);
-        let (c, swap) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&chatml::ask(&prefix, &extract_prompt(query, context)), &Sampling::precise(LEAF_TOKENS), &mut |_| {}))?;
+        let (c, swap) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&chatml::ask(&prefix, &extract_prompt(query, context)), &Sampling::precise(leaf), &mut |_| {}))?;
         if out.scores.is_empty() {
             // no scoring pass (Mode 3): this is where the part was recalled or read
             count_swap(out, &swap);
@@ -262,14 +267,14 @@ pub fn read_parts(pool: &KvPool, corpus: &dyn Corpus, query: &str, chosen: &[usi
         }
         let mut text = c.text.trim().to_string();
         if is_none(&text) && strong.contains(i) {
-            let (g, _) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&chatml::ask(&prefix, &gist_prompt(query, context)), &Sampling::precise(LEAF_TOKENS / 2), &mut |_| {}))?;
+            let (g, _) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&chatml::ask(&prefix, &gist_prompt(query, context)), &Sampling::precise(leaf / 2), &mut |_| {}))?;
             out.processed_tokens += g.prompt_tokens;
             text = g.text.trim().to_string();
         }
-        if let Some(anchor) = mid_anchor(corpus.part_text(*i)) {
+        if let Some(anchor) = mid_anchor(corpus.part_text(*i)).filter(|_| second_look) {
             let first = if text.is_empty() { "NONE".to_string() } else { text.clone() };
             let again = format!("{prefix}{}{}{}{}", chatml::user(&extract_prompt(query, context)), chatml::assistant(&first), chatml::user(&second_half_prompt(query, &anchor)), chatml::assistant_open());
-            let (m, _) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&again, &Sampling::precise(LEAF_TOKENS), &mut |_| {}))?;
+            let (m, _) = pool.with_resident(file, owner, &prefix, |llm| llm.complete(&again, &Sampling::precise(leaf), &mut |_| {}))?;
             out.processed_tokens += m.prompt_tokens;
             let more = strip_trailing_not_found(m.text.trim());
             if !is_none(&more) {

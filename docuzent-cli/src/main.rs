@@ -191,7 +191,7 @@ fn run_read(a: ReadArgs) -> Result<()> {
     let mode = ReadMode::parse(&a.mode)?;
     let think = docuzent_read::Think::parse(&a.think)?;
     let (engine, model): (Arc<dyn Engine>, String) = match &a.ollama_url {
-        Some(url) => (Arc::new(OllamaServer::connect(url, &a.ollama_model, 12288)?), a.ollama_model.clone()),
+        Some(url) => (Arc::new(OllamaServer::connect(url, &a.ollama_model, docuzent_read::budget::REFERENCE_CONTEXT.min(docuzent_read::budget::max_context()))?), a.ollama_model.clone()),
         None => {
             let s = LlamaServer::connect(&a.llm_url)?;
             let name = s.model_path().rsplit(['/', '\\']).next().unwrap_or("model").to_string();
@@ -199,6 +199,8 @@ fn run_read(a: ReadArgs) -> Result<()> {
         }
     };
     check_context(&model, engine.context_size())?;
+    // every step sized to the window (capped at docuzent's upper limit; DOCUZENT_MAX_CONTEXT lowers it)
+    let budget = docuzent_read::Budget::for_engine(engine.context_size());
     // a scope of its own, so this never touches another app's saved states in a shared directory; the model's whole
     // name, so two models that start alike (qwen3:0.6b, qwen2.5:3b) never share them
     let model_id = format!("dz-{}", model.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase());
@@ -209,7 +211,7 @@ fn run_read(a: ReadArgs) -> Result<()> {
     let book = docuzent_doc::extract::extract_book(&a.file, None)?;
     let named = pool.with_scratch(|llm| docuzent_doc::title::detect(llm, &a.file.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(), &book.text))?;
     eprintln!("{}{} - {} characters", named.title, named.author.as_ref().map(|x| format!(" by {x}")).unwrap_or_default(), book.text.len());
-    let doc = Document::from_text(&book.text, &named.title, named.author.as_deref(), &model_id, &|t| engine.count_tokens(t))?;
+    let doc = Document::from_text_sized(&book.text, &named.title, named.author.as_deref(), &model_id, &|t| engine.count_tokens(t), budget.part_tokens)?;
     let chunking = if a.guided { Chunking::Guided } else { Chunking::Plain };
     if mode.needs_saved_parts() || mode.needs_expansions() || a.guided {
         let saved = doc.save_parts(&pool, &mut |i, n| if n > 0 { eprint!("\rsaving part {} of {n}   ", i + 1) })?;
@@ -230,7 +232,7 @@ fn run_read(a: ReadArgs) -> Result<()> {
         ReadOptions::default(),
         &|s| eprintln!("  {s}"),
     )?;
-    let reply = pool.with_scratch(|llm| answer::answer_with(llm, &a.question, &reading.passages, a.offleash, think))?;
+    let reply = pool.with_scratch(|llm| answer::answer_within(llm, &a.question, &reading.passages, a.offleash, think, &budget))?;
     println!("{reply}\n");
     for p in &reading.passages {
         println!("[part {}] {}", p.part, p.text.chars().take(300).collect::<String>().replace('\n', " "));

@@ -9,14 +9,13 @@ use anyhow::{bail, Result};
 use docuzent_llm::{chatml, Llm, Sampling};
 use serde::{Deserialize, Serialize};
 
+use crate::budget::Budget;
 use crate::reader::{passages_block, Passage};
 use crate::text::needs_thinking;
 
-/// Most characters of passages an answer is given (~6,500 tokens: room in a 12,288-token window for the question,
-/// the reasoning and the answer).
+/// Most characters of passages one answer reads at the reference window ([`Budget::answer_chars`]); more are swept
+/// by [`fit_passages`], never dropped.
 pub const ANSWER_PASSAGES_CHARS: usize = 26_000;
-const ANSWER_TOKENS: i32 = 600;
-const THINK_TOKENS: i32 = 1800;
 
 /// Off the leash: the document first, then reasoning and knowledge from beyond it - always said to be so.
 pub const OFFLEASH_RULE: &str = "The person has taken you OFF THE LEASH for this answer: the rule to use only the document is lifted. Start from what the passages say and build on it: reason step by step, work numbers through, and use what you know from beyond the document where it is not enough. Say plainly which parts come from the document and which are your own reasoning or knowledge (\"the document says...\", \"beyond the document...\"). If the document is a story and what you know goes further into it than the passages do, say so before you say it.";
@@ -72,10 +71,10 @@ pub fn answer_prompt(question: &str, passages: &[Passage]) -> String {
 /// The answer prompt, on the leash (only the passages) or off it ([`OFFLEASH_RULE`]).
 pub fn answer_prompt_leash(question: &str, passages: &[Passage], offleash: bool) -> String {
     if offleash {
-        let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, ANSWER_PASSAGES_CHARS) };
+        let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, usize::MAX) };
         return format!("Passages from the document:\n{evidence}\n\nQuestion: {question}\n\n{OFFLEASH_RULE} Answer in a few sentences, showing the working.");
     }
-    let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, ANSWER_PASSAGES_CHARS) };
+    let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, usize::MAX) };
     format!(
         "Passages from the document:\n{evidence}\n\nQuestion: {question}\n\nAnswer exactly what was asked, plainly and specifically: the names, numbers, order and events the passages give. Work out any counting, adding or comparing step by step before you state it. Use only these passages - and what the question itself gives: figures or facts it states may be worked through with what the passages say (a rule, a law, a formula, a method), showing the working. If they do not say something, say in a sentence that the document does not say it, and stop: never guess, fill in, or bring in what you know from anywhere else. Answer in a few sentences."
     )
@@ -91,16 +90,88 @@ pub fn answer_leash(llm: &dyn Llm, question: &str, passages: &[Passage], offleas
     answer_with(llm, question, passages, offleash, Think::Auto)
 }
 
-/// [`answer_leash`], reasoning through first as `think` says.
+/// [`answer_leash`], reasoning through first as `think` says - sized for the reference window
+/// ([`Budget::default`]). Use [`answer_within`] with the model's own budget.
 pub fn answer_with(llm: &dyn Llm, question: &str, passages: &[Passage], offleash: bool, think: Think) -> Result<String> {
-    let prompt = answer_prompt_leash(question, passages, offleash);
-    if think.wants(question, offleash, llm.can_think()) {
-        let c = llm.complete(&format!("{}{}", chatml::user(&prompt), chatml::assistant_open_thinking()), &Sampling::thinking(ANSWER_TOKENS + THINK_TOKENS), &mut |_| {})?;
+    answer_within(llm, question, passages, offleash, think, &Budget::default())
+}
+
+/// The answer, within `budget`: every passage is read - when they are more than one call holds, they are swept
+/// first ([`fit_passages`]), never cut short.
+pub fn answer_within(llm: &dyn Llm, question: &str, passages: &[Passage], offleash: bool, think: Think, budget: &Budget) -> Result<String> {
+    let passages = fit_passages(llm, question, passages, budget)?;
+    let prompt = answer_prompt_leash(question, &passages, offleash);
+    if budget.think_tokens > 0 && think.wants(question, offleash, llm.can_think()) {
+        let c = llm.complete(&format!("{}{}", chatml::user(&prompt), chatml::assistant_open_thinking()), &Sampling::thinking(budget.answer_tokens + budget.think_tokens), &mut |_| {})?;
         if let Some(i) = c.text.find("</think>") {
             return Ok(c.text[i + "</think>".len()..].trim().to_string());
         }
     }
-    Ok(llm.complete(&chatml::ask("", &prompt), &Sampling::precise(ANSWER_TOKENS), &mut |_| {})?.text.trim().to_string())
+    Ok(llm.complete(&chatml::ask("", &prompt), &Sampling::precise(budget.answer_tokens), &mut |_| {})?.text.trim().to_string())
+}
+
+/// Characters `passages` take in a prompt.
+fn block_chars(passages: &[Passage]) -> usize {
+    passages_block(passages, usize::MAX).chars().count()
+}
+
+/// `passages`, made to fit one answering call of `budget` - **without any of them going unread**. Passages that fit
+/// are returned as they are. Otherwise they are swept: read in groups that each fit a call, every sentence that
+/// helps answer `question` copied out word for word under its part label, and those copies are the passages that go
+/// on - swept again if they still do not fit. (Cutting the list short instead would hide the passages past the cut:
+/// the answer would then say "the document does not say" about what the document says.)
+pub fn fit_passages(llm: &dyn Llm, question: &str, passages: &[Passage], budget: &Budget) -> Result<Vec<Passage>> {
+    let mut current: Vec<Passage> = passages.to_vec();
+    while block_chars(&current) > budget.answer_chars {
+        current = sweep(llm, question, &current, budget)?;
+    }
+    Ok(current)
+}
+
+pub fn sweep_prompt(question: &str, block: &str) -> String {
+    format!("Passages from the document:\n{block}\n\nQuestion: {question}\n\nCopy out, word for word, every sentence of these passages that helps answer the question - names, numbers, steps, formulas, what happened and why - each under its [part N] label. Copy nothing else and add nothing of your own. If no sentence helps, reply exactly: NONE")
+}
+
+/// One round of [`fit_passages`]: every passage read, in groups that fit a call (a passage longer than a call is
+/// split, not cut); what each group keeps is capped so that the round as a whole must shrink.
+fn sweep(llm: &dyn Llm, question: &str, passages: &[Passage], budget: &Budget) -> Result<Vec<Passage>> {
+    let room = budget.answer_chars.saturating_sub(200).max(200);
+    let mut pieces: Vec<Passage> = Vec::new();
+    for p in passages {
+        if p.text.chars().count() <= room {
+            pieces.push(p.clone());
+        } else {
+            pieces.extend(docuzent_doc::chunk::split_to_max(&p.text, room).into_iter().map(|t| Passage { text: t, ..p.clone() }));
+        }
+    }
+    let mut groups: Vec<Vec<Passage>> = vec![Vec::new()];
+    for p in pieces {
+        let last = groups.last_mut().unwrap();
+        if !last.is_empty() && block_chars(last) + p.text.chars().count() + 20 > room {
+            groups.push(vec![p]);
+        } else {
+            last.push(p);
+        }
+    }
+    // together, what the groups keep is at most about one call's worth of passages (~3 characters a token)
+    let keep_tokens = ((budget.answer_chars / 3) / groups.len()).clamp(60, budget.answer_tokens.max(60) as usize * 2) as i32;
+    let mut kept = Vec::new();
+    for g in &groups {
+        let c = llm.complete(&chatml::ask("", &sweep_prompt(question, &passages_block(g, usize::MAX))), &Sampling::precise(keep_tokens), &mut |_| {})?;
+        let text = c.text.trim();
+        if !crate::reader::is_none(text) && !text.is_empty() {
+            kept.push(Passage { part: g[0].part, book: g[0].book.clone(), text: text.to_string() });
+        }
+    }
+    // the round must shrink: what is kept was capped, so it can only be longer than its input if the model padded
+    // it - then keep each group's copy to its share
+    if block_chars(&kept) >= block_chars(passages) {
+        let share = (budget.answer_chars / kept.len().max(1)).max(100);
+        for k in &mut kept {
+            k.text = k.text.chars().take(share).collect();
+        }
+    }
+    Ok(kept)
 }
 
 #[cfg(test)]
@@ -134,5 +205,37 @@ mod tests {
         assert_eq!((Think::parse("always").unwrap(), Think::parse("off").unwrap(), Think::parse("").unwrap()), (Think::Always, Think::Never, Think::Auto));
         assert!(Think::parse("maybe").is_err());
         assert_eq!(serde_json::to_string(&Think::Always).unwrap(), "\"always\"");
+    }
+
+    /// More passages than a small window holds: every one is read (in groups that fit), the sentences that bear
+    /// on the question kept, and the answer reads those - the passage that answers, at the end of the list, is
+    /// not cut off.
+    #[test]
+    fn passages_too_many_for_the_window_are_swept_and_none_goes_unread() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let e = SimEngine::new(1024, move |p| {
+            log.lock().unwrap().push(p.to_string());
+            if p.contains("Copy out, word for word") {
+                // keep the sentence about the dragon, if this group has it
+                if p.contains("dragon egg") { "[part 9] Hagrid won the dragon egg in a card game.".into() } else { "NONE".into() }
+            } else if p.contains("Hagrid won the dragon egg") {
+                "In a card game.".into()
+            } else {
+                "The document does not say.".into()
+            }
+        });
+        let b = Budget::for_context(1024);
+        let mut passages: Vec<Passage> = (1..=8).map(|i| Passage { part: i, book: String::new(), text: format!("Part {i} is about something else entirely. {}", "Filler words go here. ".repeat(40)) }).collect();
+        passages.push(Passage { part: 9, book: String::new(), text: "Hagrid won the dragon egg in a card game at the pub.".into() });
+        assert!(block_chars(&passages) > b.answer_chars, "more than one call holds");
+        let fitted = fit_passages(&e, "Where did Hagrid get the dragon egg?", &passages, &b).unwrap();
+        assert!(block_chars(&fitted) <= b.answer_chars);
+        let prompts = seen.lock().unwrap().clone();
+        for p in &passages {
+            assert!(prompts.iter().any(|x| x.contains(&p.text[..30])), "part {} was read", p.part);
+        }
+        assert_eq!(answer_within(&e, "Where did Hagrid get the dragon egg?", &passages, false, Think::Auto, &b).unwrap(), "In a card game.");
     }
 }

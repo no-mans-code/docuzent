@@ -186,7 +186,12 @@ impl Index {
 
     /// Plain chunks of every part.
     pub fn plain(part_texts: &[&str]) -> Self {
-        Self::new(Chunking::Plain, part_texts.iter().map(|t| plain_chunks(t, CHUNK_CHARS)).collect())
+        Self::plain_sized(part_texts, CHUNK_CHARS)
+    }
+
+    /// [`Index::plain`] with chunks of at most `chunk_chars` (a model's [`crate::Budget::chunk_chars`]).
+    pub fn plain_sized(part_texts: &[&str], chunk_chars: usize) -> Self {
+        Self::new(Chunking::Plain, part_texts.iter().map(|t| plain_chunks(t, chunk_chars)).collect())
     }
 
     pub fn has_expansions(&self) -> bool {
