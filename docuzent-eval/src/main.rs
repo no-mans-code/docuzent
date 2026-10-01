@@ -28,7 +28,8 @@ use docuzent_doc::{hash, title};
 use docuzent_kv::KvStore;
 use docuzent_llm::{Embedder, Engine, LlamaServer, OllamaServer, OpenAiEmbedder};
 use docuzent_read::expand::{expand, guided_index};
-use docuzent_read::{answer, check_context, read, Think, Chunking, Corpus, Document, Index, Mode, ReadOptions, Sources};
+use docuzent_read::budget::{max_context, REFERENCE_CONTEXT};
+use docuzent_read::{answer, check_context, read, Budget, Think, Chunking, Corpus, Document, Index, Mode, ReadOptions, Sources};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,10 @@ struct Cli {
     ollama_url: Option<String>,
     #[arg(long, default_value = "qwen3:14b")]
     ollama_model: String,
+    /// The window to read with, in tokens (Ollama only: a llama.cpp server's is its own) - at most the model's own
+    /// and docuzent's upper limit; every step is sized to it
+    #[arg(long)]
+    context: Option<usize>,
     /// The KV store directory - the model server's --slot-save-path
     #[arg(long, default_value = "/kv")]
     kv_dir: PathBuf,
@@ -234,7 +239,9 @@ fn main() -> Result<()> {
     // the engine
     let (engine, model): (Arc<dyn Engine>, String) = match &cli.ollama_url {
         Some(url) => {
-            let o = OllamaServer::connect(url, &cli.ollama_model, 12288)?;
+            // the window asked of Ollama: --context, at most the model's own and docuzent's upper limit
+            let want = cli.context.unwrap_or(REFERENCE_CONTEXT).min(max_context());
+            let o = OllamaServer::connect(url, &cli.ollama_model, want)?;
             (Arc::new(o), format!("ollama:{}", cli.ollama_model))
         }
         None => {
@@ -244,7 +251,11 @@ fn main() -> Result<()> {
         }
     };
     check_context(&model, engine.context_size())?;
-    eprintln!("[eval] model {model}: a {}-token window", engine.context_size());
+    // every step sized to the window: the engine's, capped at docuzent's upper limit (DOCUZENT_MAX_CONTEXT lowers it)
+    let budget = Budget::for_engine(engine.context_size());
+    eprintln!("[eval] model {model}: a {}-token window (reading plans for {}): parts of {} tokens, chunks of {} characters, {} chunks per search, {} characters per answer", engine.context_size(), budget.context, budget.part_tokens, budget.chunk_chars, budget.rag_chunks, budget.answer_chars);
+    // a window other than the reference reads differently: its saved parts, indexes and report are its own
+    let model = if budget.context == REFERENCE_CONTEXT { model } else { format!("{model} @{}", budget.context) };
     // What saved states and indexes are filed under. An Ollama model's whole name - its first letters alone would
     // file qwen3:0.6b and qwen2.5:3b together; a weights file keeps the short id its saved states already have.
     let short: String = model.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
@@ -263,7 +274,7 @@ fn main() -> Result<()> {
     let detected = pool.with_scratch(|llm| title::detect(llm, &file_name_for_title, &text)).ok();
     eprintln!("[eval] {} - {} chars; title read as {:?}", set.book, text.len(), detected.as_ref().map(|t| (&t.title, &t.author)));
 
-    let corpus = Document::from_text(&text, &set.book, None, &model_id, &|s| engine.count_tokens(s))?;
+    let corpus = Document::from_text_sized(&text, &set.book, None, &model_id, &|s| engine.count_tokens(s), budget.part_tokens)?;
     eprintln!("[eval] {} parts", corpus.part_count());
 
     let learned_path = work.join(format!("learned-{model_id}.json"));
@@ -344,7 +355,7 @@ fn main() -> Result<()> {
         }
         let t = Instant::now();
         let mut ix = match chunking {
-            Chunking::Plain => Index::plain(&(0..corpus.part_count()).map(|i| corpus.part_text(i)).collect::<Vec<_>>()),
+            Chunking::Plain => Index::plain_sized(&(0..corpus.part_count()).map(|i| corpus.part_text(i)).collect::<Vec<_>>(), budget.chunk_chars),
             Chunking::Guided => guided_index(&pool, &corpus, &mut |i, n| eprintln!("[eval] guided chunking: part {} of {n}", i + 1))?,
         };
         match chunking {
@@ -388,7 +399,7 @@ fn main() -> Result<()> {
             let reading = read(*mode, Sources { pool: &pool, corpus: &corpus, indexes: index.as_ref().map(|i| vec![docuzent_read::Shelf { index: i, first_part: 0 }]).unwrap_or_default(), embedder: embedder.as_deref() }, &q.q, ReadOptions::default(), &|_| {})?;
             let read_s = secs(t);
             let ta = Instant::now();
-            let ans = pool.with_scratch(|llm| answer::answer_with(llm, &q.q, &reading.passages, *offleash, *think))?;
+            let ans = pool.with_scratch(|llm| answer::answer_within(llm, &q.q, &reading.passages, *offleash, *think, &budget))?;
             let answer_s = secs(ta);
             let seconds = secs(t);
             let problems = check(q, &ans, *offleash);

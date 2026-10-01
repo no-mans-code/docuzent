@@ -27,8 +27,14 @@ impl Document {
     /// `text` split into parts that fit one context (`count` is the model's tokenizer), each named for its saved
     /// state under `model_id` - which should start with the KV store's scope, if it has one.
     pub fn from_text(text: &str, title: &str, author: Option<&str>, model_id: &str, count: &dyn Fn(&str) -> Result<usize>) -> Result<Self> {
+        Self::from_text_sized(text, title, author, model_id, count, PART_TOKEN_LIMIT)
+    }
+
+    /// [`Document::from_text`] with parts of at most `part_tokens` (a model's [`crate::Budget::part_tokens`]: a
+    /// small window reads a document in more, smaller parts).
+    pub fn from_text_sized(text: &str, title: &str, author: Option<&str>, model_id: &str, count: &dyn Fn(&str) -> Result<usize>, part_tokens: usize) -> Result<Self> {
         let id: String = hash::hash_bytes(text.as_bytes()).chars().take(12).collect();
-        let parts = split_into_parts(text, PART_TOKEN_LIMIT, count)?;
+        let parts = split_into_parts(text, part_tokens, count)?;
         Ok(Self { parts: parts.into_iter().map(|p| (file_name(model_id, &id, &p.kv_kind()), p)).collect(), id, title: title.to_string(), author: author.map(str::to_string) })
     }
 
@@ -46,7 +52,10 @@ impl Document {
     /// The index for `chunking` (with Mode 2's expansions by `model_id` when `expanded`), from `dir` if it was made
     /// before in the same way, else made now and kept there.
     pub fn index(&self, pool: &KvPool, dir: &Path, chunking: Chunking, expanded: bool, model_id: &str, embedder: Option<&dyn Embedder>, on_stage: &mut dyn FnMut(&str)) -> Result<Index> {
-        let key = format!("{}{}-{model_id}", if chunking == Chunking::Guided { "guided" } else { "plain" }, if expanded { "-expanded" } else { "" });
+        // chunks sized for this model's window (an index made for another size is another index)
+        let chunk_chars = crate::Budget::for_engine(pool.engine().context_size()).chunk_chars;
+        let size = if chunk_chars == crate::index::CHUNK_CHARS { String::new() } else { format!("-c{chunk_chars}") };
+        let key = format!("{}{}{size}-{model_id}", if chunking == Chunking::Guided { "guided" } else { "plain" }, if expanded { "-expanded" } else { "" });
         let dir = dir.join(format!("index-{key}"));
         if let Some(mut ix) = Index::load(&dir)? {
             if ix.embed_model == embedder.map(|e| e.id()) {
@@ -64,7 +73,7 @@ impl Document {
             }
         }
         let mut ix = match chunking {
-            Chunking::Plain => Index::plain(&(0..self.parts.len()).map(|i| self.part_text(i)).collect::<Vec<_>>()),
+            Chunking::Plain => Index::plain_sized(&(0..self.parts.len()).map(|i| self.part_text(i)).collect::<Vec<_>>(), chunk_chars),
             Chunking::Guided => {
                 on_stage("finding where scenes and topics change");
                 guided_index(pool, self, &mut |_, _| {})?

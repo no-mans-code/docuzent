@@ -200,21 +200,23 @@ pub fn read(mode: Mode, src: Sources, query: &str, opts: ReadOptions, on_stage: 
         }
         return scan(pool, corpus, query, opts, on_stage);
     }
+    // how much to hand over, for this model's window (at 12,288 tokens: 8 chunks; 12 and 4 parts for Mode 3)
+    let b = crate::Budget::for_engine(pool.engine().context_size());
     match mode {
         Mode::Rag | Mode::RagExpanded => {
             on_stage(if indexes.len() > 1 { "Searching each book's index" } else { "Searching the book's index" });
-            let found = search_each(&indexes, query, RAG_CHUNKS, mode, embedder, opts.only)?;
-            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &with_neighbours(&indexes, &found, NEIGHBOUR_CHARS)), ..Default::default() };
+            let found = search_each(&indexes, query, b.rag_chunks, mode, embedder, opts.only)?;
+            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &with_neighbours(&indexes, &found, b.neighbour_chars)), ..Default::default() };
             out.ms = started.elapsed().as_secs_f64() * 1000.0;
             Ok(out)
         }
         Mode::RagKv => {
             on_stage(if indexes.len() > 1 { "Searching each book's index for the parts to read" } else { "Searching the book's index for the parts to read" });
-            let found = search_each(&indexes, query, RAG_KV_CHUNKS, mode, embedder, opts.only)?;
+            let found = search_each(&indexes, query, b.rag_kv_chunks, mode, embedder, opts.only)?;
             // the parts the best chunks are in, best first, then read in document order
             let mut parts: Vec<usize> = Vec::new();
             for f in &found {
-                if !parts.contains(&f.part) && parts.len() < RAG_KV_PARTS {
+                if !parts.contains(&f.part) && parts.len() < b.rag_kv_parts {
                     parts.push(f.part);
                 }
             }
@@ -223,7 +225,7 @@ pub fn read(mode: Mode, src: Sources, query: &str, opts: ReadOptions, on_stage: 
             // writes stands between them and the answer. (A first version handed over only its readings of the whole
             // parts, and lost a verse the plain passages had - a model's reading can blur or drop a line.) The parts
             // they point at are then read whole, and what those readings add comes after, as enrichment.
-            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &found[..found.len().min(RAG_CHUNKS)]), ..Default::default() };
+            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &found[..found.len().min(b.rag_chunks)]), ..Default::default() };
             let mut read = Reading::default();
             read_parts(pool, corpus, query, &parts, &[], opts, on_stage, &mut read)?;
             out.recalled = read.recalled;

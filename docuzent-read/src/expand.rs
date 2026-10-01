@@ -19,13 +19,13 @@ use docuzent_llm::{chatml, json, Sampling};
 use serde_json::Value;
 
 use crate::corpus::Corpus;
-use crate::index::{cut_at, Chunking, Entry, EntryKind, Index, CHUNK_CHARS};
+use crate::index::{cut_at, Chunking, Entry, EntryKind, Index};
 
 /// Chunks described in one call: enough to amortise the call, few enough that the reply stays well-formed.
+/// At the reference window (smaller windows describe one at a time - [`crate::Budget::expand_batch`]). A reply cut
+/// off at its token limit loses only the passage it was writing (what it finished is kept), and that passage is
+/// described again on its own.
 pub const EXPAND_BATCH: usize = 3;
-/// Room for three passages' descriptions. A reply cut off at this limit loses only the passage it was writing (what
-/// it finished is kept), and that passage is described again on its own.
-const EXPAND_TOKENS: i32 = 1600;
 const CUT_TOKENS: i32 = 300;
 
 pub fn cut_prompt() -> String {
@@ -62,7 +62,7 @@ pub fn guided_index(pool: &KvPool, corpus: &dyn Corpus, on_progress: &mut dyn Fn
         let (c, _) = pool.with_resident(corpus.part_file(i), corpus.part_owner(i), &prefix, |llm| llm.complete(&chatml::ask(&prefix, &cut_prompt()), &Sampling::precise(CUT_TOKENS), &mut |_| {}))?;
         let text = corpus.part_text(i);
         let starts: Vec<usize> = if crate::reader::is_none(&c.text) { Vec::new() } else { c.text.lines().filter_map(|l| locate(text, l.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == ' '))).collect() };
-        parts_chunks.push(cut_at(text, &starts, CHUNK_CHARS));
+        parts_chunks.push(cut_at(text, &starts, crate::Budget::for_engine(pool.engine().context_size()).chunk_chars));
     }
     on_progress(n, n);
     Ok(Index::new(Chunking::Guided, parts_chunks))
@@ -129,6 +129,8 @@ pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str
     let mut entries: Vec<Entry> = if repair { index.entries.iter().filter(|e| e.kind.is_expansion()).cloned().collect() } else { Vec::new() };
     let total = todo.len();
     let mut done = 0;
+    // passages per call and what a call may write, for this model's window (3 and 1,600 tokens at 12,288)
+    let b = crate::Budget::for_engine(pool.engine().context_size());
     // described alone and still not: kept by their own text, not tried again on every load
     let mut failed_alone: Vec<usize> = Vec::new();
     for part in 0..corpus.part_count() {
@@ -140,10 +142,10 @@ pub fn expand(pool: &KvPool, corpus: &dyn Corpus, index: &mut Index, model: &str
         let describe = |batch: &[usize]| -> Result<Vec<Entry>> {
             let texts: Vec<&str> = batch.iter().map(|id| index.chunks[*id].text.as_str()).collect();
             let prompt = chatml::ask(&prefix, &expand_prompt(&texts));
-            let (c, _) = pool.with_resident(corpus.part_file(part), corpus.part_owner(part), &prefix, |llm| llm.complete(&prompt, &Sampling::precise(EXPAND_TOKENS), &mut |_| {}))?;
+            let (c, _) = pool.with_resident(corpus.part_file(part), corpus.part_owner(part), &prefix, |llm| llm.complete(&prompt, &Sampling::precise(b.expand_tokens), &mut |_| {}))?;
             Ok(parse_expansions(&c.text, batch, &texts))
         };
-        for batch in ids.chunks(EXPAND_BATCH) {
+        for batch in ids.chunks(b.expand_batch) {
             on_progress(done, total);
             let got = describe(batch)?;
             let missing: Vec<usize> = batch.iter().copied().filter(|id| !got.iter().any(|e| e.chunk == *id)).collect();
