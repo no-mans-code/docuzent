@@ -165,3 +165,40 @@ fn guided_chunking_cuts_where_the_model_says_a_section_starts() {
     assert_eq!(index.chunks.iter().filter(|c| c.part == 1).count(), 1, "a part the model calls one section stays whole");
     let _ = std::fs::remove_dir_all(&r.dir);
 }
+
+/// A model that is cut off whenever it describes more than one passage: it finishes the first and stops mid-way
+/// through the second. Every passage still gets described - the ones it was cut off on, on their own.
+fn cut_off_responder(prompt: &str) -> String {
+    if prompt.contains("Below are passages from this part of the book") {
+        let one = r#"{"n": 1, "context": "", "people": "", "setting": "a described passage", "facts": [], "questions": []}"#;
+        return if prompt.contains("\n[2]\n") { format!(r#"[{one}, {{"n": 2, "context": "and then the tok"#) } else { format!("[{one}]") };
+    }
+    String::new()
+}
+
+#[test]
+fn a_batch_cut_off_mid_way_is_described_again_passage_by_passage_and_a_second_pass_repairs_only_what_is_missing() {
+    let dir = std::env::temp_dir().join(format!("docuzent-modes-cutoff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = Arc::new(SimEngine::new(12288, cut_off_responder).in_dir(&dir));
+    let pool = KvPool::new(engine.clone(), Arc::new(KvStore::open(&dir, 1 << 30).unwrap()));
+    // one long part: several chunks, so passages are described three at a time
+    let text = (0..7).map(|i| format!("Paragraph {i}. {}", "Something happens here, and then something else. ".repeat(30))).collect::<Vec<_>>().join("\n\n");
+    let corpus = MemCorpus { title: "The Book".into(), owner: "book".into(), parts: vec![("m-long-p0.kv".into(), chatml::system(&format!("Part 1 of the book.\n\n{text}")), text.clone())], gist: String::new() };
+    pool.prime(&corpus.parts[0].0, "book", &corpus.parts[0].1).unwrap();
+    let mut index = Index::plain(&[text.as_str()]);
+    assert!(index.chunks.len() >= 4, "{} chunks", index.chunks.len());
+    let left = expand(&pool, &corpus, &mut index, "sim-model", &mut |_, _| {}).unwrap();
+    assert_eq!((left, index.unexpanded()), (0, Vec::<usize>::new()), "every chunk described");
+
+    // an index with a chunk's descriptions lost is repaired: only that chunk is described again
+    let lost = 1;
+    index.add_expansions(index.entries.iter().filter(|e| e.kind.is_expansion() && e.chunk != lost).cloned().collect(), "sim-model");
+    assert_eq!(index.unexpanded(), vec![lost]);
+    engine.clear_events();
+    assert_eq!(expand(&pool, &corpus, &mut index, "sim-model", &mut |_, _| {}).unwrap(), 0);
+    assert!(index.unexpanded().is_empty());
+    let calls = engine.events().iter().filter(|e| matches!(e, docuzent_llm::sim::Event::Complete { .. })).count();
+    assert_eq!(calls, 1, "one call, for the one chunk that was missing");
+    let _ = std::fs::remove_dir_all(&dir);
+}

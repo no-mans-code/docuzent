@@ -48,8 +48,18 @@ impl Document {
     pub fn index(&self, pool: &KvPool, dir: &Path, chunking: Chunking, expanded: bool, model_id: &str, embedder: Option<&dyn Embedder>, on_stage: &mut dyn FnMut(&str)) -> Result<Index> {
         let key = format!("{}{}-{model_id}", if chunking == Chunking::Guided { "guided" } else { "plain" }, if expanded { "-expanded" } else { "" });
         let dir = dir.join(format!("index-{key}"));
-        if let Some(ix) = Index::load(&dir)? {
+        if let Some(mut ix) = Index::load(&dir)? {
             if ix.embed_model == embedder.map(|e| e.id()) {
+                // expansions this model made, with some chunks left undescribed: describe just those
+                if !(expanded && ix.made_by.as_deref() == Some(model_id) && !ix.unexpanded().is_empty()) {
+                    return Ok(ix);
+                }
+                on_stage("describing the passages the index is missing");
+                expand(pool, self, &mut ix, model_id, &mut |_, _| {})?;
+                if let Some(e) = embedder {
+                    ix.embed(e, &mut |_, _| {})?;
+                }
+                ix.save(&dir)?;
                 return Ok(ix);
             }
         }
