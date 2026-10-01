@@ -58,7 +58,12 @@
     "birthless",
     "deathless",
     "cannot slay",
-    "not slain"
+    "not slain",
+    "neither born",
+    "unborn",
+    "not born",
+    "nor (can|does) (it|he) die",
+    "undying"
    ],
    "set": "held-out"
   },

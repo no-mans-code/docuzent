@@ -127,6 +127,9 @@ fn mode_3_reads_only_the_parts_the_index_points_at_whole_without_scoring() {
     assert!(reading.scores.is_empty(), "no part was scored");
     assert!(reading.read_closely >= 1 && reading.read_closely <= docuzent_read::modes::RAG_KV_PARTS, "{}", reading.read_closely);
     assert!(reading.passages.iter().any(|p| p.part == 4 && p.text.contains("Neville Longbottom")), "{:?}", reading.passages);
+    // the index's passages come first, in the book's own words; the whole-part reading enriches after them
+    let first_read = reading.passages.iter().position(|p| p.text.starts_with("It says:")).expect("the part's reading is there");
+    assert!(first_read > 0 && reading.passages[..first_read].iter().all(|p| !p.text.starts_with("It says:")), "{:?}", reading.passages);
     assert!(prompts.len() <= 2 * docuzent_read::modes::RAG_KV_PARTS, "an extraction and a second-half look per part, nothing more: {}", prompts.len());
     let _ = std::fs::remove_dir_all(&r.dir);
 }

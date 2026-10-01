@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BOOK="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 SET="$2"
-RUNS="${3:-rag,rag:guided,rag-expanded,rag-kv,rag-kv:expanded,kv}"
+RUNS="${3:-rag,rag:guided,rag-expanded,rag-kv,kv}"
 shift 3 2>/dev/null || shift $#
 docker run --rm --label docuzent-eval=1 \
   --network "${EVAL_NETWORK:-thebook_default}" \

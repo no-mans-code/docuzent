@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | [`Mode::Rag`] | cut into chunks, indexed (words + vectors) | the best chunks, as they are |
 //! | [`Mode::RagExpanded`] | ... and every chunk described by the model (context, people, setting, facts, questions) | the best chunks, found through any of those |
-//! | [`Mode::RagKv`] | an index (expanded if it has been) **and** every part's KV state saved | the index points at the parts; those parts are restored and read closely, whole |
+//! | [`Mode::RagKv`] | the expanded index **and** every part's KV state saved | the expanded index's passages first, as they are; then the parts they point at, restored and read whole, as enrichment |
 //! | [`Mode::Kv`] | every part's KV state saved | every part restored and scored; the relevant ones read closely |
 //!
 //! Which is best depends on the document and the question; the evaluation (`docuzent-eval`) measures each on real
@@ -64,7 +64,7 @@ impl Mode {
         match self {
             Mode::Rag => "RAG",
             Mode::RagExpanded => "RAG, expanded",
-            Mode::RagKv => "RAG + saved parts",
+            Mode::RagKv => "expanded RAG, enriched from saved parts",
             Mode::Kv => "saved parts (read every part)",
         }
     }
@@ -73,8 +73,10 @@ impl Mode {
         self != Mode::Kv
     }
 
+    /// Mode 2 searches the expanded index; so does Mode 3, whose passages come first and are enriched from the
+    /// saved parts they point at.
     pub fn needs_expansions(self) -> bool {
-        self == Mode::RagExpanded
+        matches!(self, Mode::RagExpanded | Mode::RagKv)
     }
 
     /// Whether every part's KV state must be saved when the document is learned.
@@ -184,12 +186,19 @@ pub fn read(mode: Mode, src: Sources, query: &str, opts: ReadOptions, on_stage: 
                 }
             }
             parts.sort_unstable();
-            let mut out = Reading { retrieved: found.len(), ..Default::default() };
-            read_parts(pool, corpus, query, &parts, &[], opts, on_stage, &mut out)?;
-            if out.passages.is_empty() {
-                // the parts, read whole, said nothing: the chunks that pointed at them are still the best evidence there is
-                out.passages = chunk_passages(corpus, &found[..found.len().min(RAG_CHUNKS)]);
-            }
+            // The passages the index found come first, in the book's own words: they are precise, and nothing a model
+            // writes stands between them and the answer. (A first version handed over only its readings of the whole
+            // parts, and lost a verse the plain passages had - a model's reading can blur or drop a line.) The parts
+            // they point at are then read whole, and what those readings add comes after, as enrichment.
+            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &found[..found.len().min(RAG_CHUNKS)]), ..Default::default() };
+            let mut read = Reading::default();
+            read_parts(pool, corpus, query, &parts, &[], opts, on_stage, &mut read)?;
+            out.recalled = read.recalled;
+            out.read_afresh = read.read_afresh;
+            out.processed_tokens = read.processed_tokens;
+            out.read_closely = read.read_closely;
+            out.truncated = read.truncated;
+            out.passages.extend(read.passages);
             out.ms = started.elapsed().as_secs_f64() * 1000.0;
             Ok(out)
         }
