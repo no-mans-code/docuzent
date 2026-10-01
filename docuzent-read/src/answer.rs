@@ -132,6 +132,67 @@ pub fn sweep_prompt(question: &str, block: &str) -> String {
     format!("Passages from the document:\n{block}\n\nQuestion: {question}\n\nCopy out, word for word, every sentence of these passages that helps answer the question - names, numbers, steps, formulas, what happened and why - each under its [part N] label. Copy nothing else and add nothing of your own. If no sentence helps, reply exactly: NONE")
 }
 
+/// The sentences of `text`: split after `.`, `!`, `?` or `…` followed by a space, and at line breaks.
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let mut start = 0;
+        for (n, &(i, c)) in chars.iter().enumerate() {
+            let ends = matches!(c, '.' | '!' | '?' | '…') && chars.get(n + 1).is_none_or(|&(_, next)| next.is_whitespace());
+            if ends || n + 1 == chars.len() {
+                let end = i + c.len_utf8();
+                let s = line[start..end].trim();
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+                start = end;
+            }
+        }
+    }
+    out
+}
+
+/// A group's passages as numbered sentences ("[n] (part P) ..."), and for each number the passage it came from.
+fn number_sentences(group: &[Passage]) -> (String, Vec<(usize, String)>) {
+    let mut listing = String::new();
+    let mut index = Vec::new();
+    for (p, passage) in group.iter().enumerate() {
+        for s in sentences(&passage.text) {
+            index.push((p, s.clone()));
+            listing.push_str(&format!("[{}] (part {}) {s}\n", index.len(), passage.part));
+        }
+    }
+    (listing, index)
+}
+
+pub fn pick_prompt(question: &str, numbered: &str) -> String {
+    format!("Numbered sentences from the document:\n{numbered}\nQuestion: {question}\n\nWhich of these sentences help answer the question - names, numbers, steps, formulas, what happened and why? Reply with their numbers only, separated by commas (for example: 3, 7, 12), and nothing else. If none helps, reply exactly: NONE")
+}
+
+/// Room to write the numbers of every sentence, and no more.
+fn pick_tokens(sentences: usize) -> i32 {
+    (sentences * 3 + 16).min(600) as i32
+}
+
+/// The sentence numbers a reply names (each between 1 and `count`), in order, once each.
+fn picked_numbers(reply: &str, count: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = reply.split(|c: char| !c.is_ascii_digit()).filter_map(|t| t.parse().ok()).filter(|n| (1..=count).contains(n)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The picked sentences, copied exactly, gathered back under the passages they came from (in their order).
+fn picked_passages(group: &[Passage], index: &[(usize, String)], picked: &[usize]) -> Vec<Passage> {
+    let mut by_passage: Vec<Vec<&str>> = vec![Vec::new(); group.len()];
+    for &n in picked {
+        let (p, s) = &index[n - 1];
+        by_passage[*p].push(s);
+    }
+    by_passage.into_iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(p, s)| Passage { text: s.join(" "), ..group[p].clone() }).collect()
+}
+
 /// One round of [`fit_passages`]: every passage read, in groups that fit a call (a passage longer than a call is
 /// split, not cut); what each group keeps is capped so that the round as a whole must shrink.
 fn sweep(llm: &dyn Llm, question: &str, passages: &[Passage], budget: &Budget) -> Result<Vec<Passage>> {
@@ -157,6 +218,20 @@ fn sweep(llm: &dyn Llm, question: &str, passages: &[Passage], budget: &Budget) -
     let keep_tokens = ((budget.answer_chars / 3) / groups.len()).clamp(60, budget.answer_tokens.max(60) as usize * 2) as i32;
     let mut kept = Vec::new();
     for g in &groups {
+        // The model points at the sentences that help, by number, and they are copied here exactly - a few tokens
+        // to write instead of the sentences themselves (on Qwen3-14B ~2 s a group instead of ~30), and no quotation
+        // can come out reworded. A reply with no numbers in it falls back to the model copying them out.
+        let numbered = number_sentences(g);
+        let c = llm.complete(&chatml::ask("", &pick_prompt(question, &numbered.0)), &Sampling::precise(pick_tokens(numbered.1.len())), &mut |_| {})?;
+        let reply = c.text.trim();
+        if crate::reader::is_none(reply) {
+            continue;
+        }
+        let picked = picked_numbers(reply, numbered.1.len());
+        if !picked.is_empty() {
+            kept.extend(picked_passages(g, &numbered.1, &picked));
+            continue;
+        }
         let c = llm.complete(&chatml::ask("", &sweep_prompt(question, &passages_block(g, usize::MAX))), &Sampling::precise(keep_tokens), &mut |_| {})?;
         let text = c.text.trim();
         if !crate::reader::is_none(text) && !text.is_empty() {
@@ -164,7 +239,7 @@ fn sweep(llm: &dyn Llm, question: &str, passages: &[Passage], budget: &Budget) -
         }
     }
     // the round must shrink: what is kept was capped, so it can only be longer than its input if the model padded
-    // it - then keep each group's copy to its share
+    // it (or picked every sentence) - then keep each group's copy to its share
     if block_chars(&kept) >= block_chars(passages) {
         let share = (budget.answer_chars / kept.len().max(1)).max(100);
         for k in &mut kept {
@@ -217,9 +292,9 @@ mod tests {
         let log = seen.clone();
         let e = SimEngine::new(1024, move |p| {
             log.lock().unwrap().push(p.to_string());
-            if p.contains("Copy out, word for word") {
-                // keep the sentence about the dragon, if this group has it
-                if p.contains("dragon egg") { "[part 9] Hagrid won the dragon egg in a card game.".into() } else { "NONE".into() }
+            if p.contains("Numbered sentences from the document") {
+                // point at the sentence about the dragon, if this group has it
+                p.lines().find(|l| l.contains("dragon egg") && l.starts_with('[')).and_then(|l| l[1..].split(']').next()).map(str::to_string).unwrap_or_else(|| "NONE".into())
             } else if p.contains("Hagrid won the dragon egg") {
                 "In a card game.".into()
             } else {
@@ -237,5 +312,30 @@ mod tests {
             assert!(prompts.iter().any(|x| x.contains(&p.text[..30])), "part {} was read", p.part);
         }
         assert_eq!(answer_within(&e, "Where did Hagrid get the dragon egg?", &passages, false, Think::Auto, &b).unwrap(), "In a card game.");
+        assert!(fitted.iter().any(|f| f.part == 9 && f.text == "Hagrid won the dragon egg in a card game at the pub."), "the sentence is the book's own, copied exactly: {fitted:?}");
+        assert!(!prompts.iter().any(|x| x.contains("Copy out, word for word")), "the model only pointed; it copied nothing");
+    }
+
+    #[test]
+    fn sentences_are_numbered_picked_by_number_and_copied_exactly() {
+        assert_eq!(sentences("One. Two? Three!
+Four… five"), vec!["One.", "Two?", "Three!", "Four…", "five"]);
+        assert_eq!(sentences("Mr. Smith arrived."), vec!["Mr.", "Smith arrived."], "an abbreviation splits a sentence - picked by number, both halves are still the book's words");
+        assert_eq!(picked_numbers("Sentences 3, 7 and 12. Also 7, and 99.", 12), vec![3, 7, 12], "in order, once, only real numbers");
+        let g = vec![Passage { part: 2, book: String::new(), text: "A. B. C.".into() }, Passage { part: 5, book: String::new(), text: "D. E.".into() }];
+        let (listing, index) = number_sentences(&g);
+        assert!(listing.contains("[2] (part 2) B.") && listing.contains("[5] (part 5) E."));
+        let kept = picked_passages(&g, &index, &[1, 3, 5]);
+        assert_eq!(kept.iter().map(|p| (p.part, p.text.as_str())).collect::<Vec<_>>(), vec![(2, "A. C."), (5, "E.")]);
+    }
+
+    /// A model that does not answer with numbers: the group is copied out the old way instead - never dropped.
+    #[test]
+    fn a_reply_without_numbers_falls_back_to_copying() {
+        let e = SimEngine::new(1024, |p| if p.contains("Numbered sentences") { "The second one, I think.".into() } else if p.contains("Copy out, word for word") { "[part 9] The egg came from a card game.".into() } else { "ok".into() });
+        let b = Budget::for_context(1024);
+        let passages: Vec<Passage> = (1..=9).map(|i| Passage { part: i, book: String::new(), text: format!("Part {i} sentence. {}", "More words here. ".repeat(40)) }).collect();
+        let fitted = fit_passages(&e, "Where did the egg come from?", &passages, &b).unwrap();
+        assert!(fitted.iter().any(|f| f.text.contains("card game")), "{fitted:?}");
     }
 }
