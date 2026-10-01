@@ -21,6 +21,11 @@ use crate::reader::{read_parts, scan, Passage, ReadOptions, Reading};
 
 /// Chunks the RAG modes hand to the answer.
 pub const RAG_CHUNKS: usize = 8;
+/// Characters of each neighbouring chunk handed over with a chunk a RAG search found (Modes 1 and 2): the end of the
+/// one before and the start of the one after, from the same part. A chunk is cut at a size, not where the book's
+/// thought ends, so an answer can begin in the chunk before the one that matched or end in the one after; and the
+/// line that names who "he" is is often just before. ("Small-to-big" retrieval: search small, read bigger.)
+pub const NEIGHBOUR_CHARS: usize = 600;
 /// Chunks Mode 3 looks at to choose parts...
 pub const RAG_KV_CHUNKS: usize = 12;
 /// ... and the most parts it then reads closely.
@@ -116,13 +121,16 @@ pub struct Found {
     /// 0-based part in the corpus.
     pub part: usize,
     pub text: String,
+    /// Which shelf (document index) it was found in, and its chunk id there.
+    pub shelf: usize,
+    pub chunk: usize,
 }
 
 /// Searches every document's index on its own for its best `k` chunks, then takes them in turn - the best of each,
 /// then the second best of each, and so on - up to `k` in all.
 pub fn search_each(shelves: &[Shelf], query: &str, k: usize, mode: Mode, embedder: Option<&dyn Embedder>, only: Option<&[usize]>) -> Result<Vec<Found>> {
     let mut per: Vec<Vec<Found>> = Vec::with_capacity(shelves.len());
-    for shelf in shelves {
+    for (s, shelf) in shelves.iter().enumerate() {
         let how = if mode == Mode::Rag || !shelf.index.has_expansions() { Search::TextOnly } else { Search::Expanded };
         let local: Option<Vec<usize>> = only.map(|o| o.iter().filter(|p| **p >= shelf.first_part).map(|p| p - shelf.first_part).collect());
         if local.as_ref().is_some_and(|l| l.is_empty()) {
@@ -130,7 +138,7 @@ pub fn search_each(shelves: &[Shelf], query: &str, k: usize, mode: Mode, embedde
             continue;
         }
         let hits = shelf.index.search(query, k, how, embedder, local.as_deref())?;
-        per.push(hits.into_iter().map(|(c, _)| &shelf.index.chunks[c]).map(|c| Found { part: c.part + shelf.first_part, text: c.text.clone() }).collect());
+        per.push(hits.into_iter().map(|(c, _)| &shelf.index.chunks[c]).map(|c| Found { part: c.part + shelf.first_part, text: c.text.clone(), shelf: s, chunk: c.id }).collect());
     }
     let mut out = Vec::new();
     for rank in 0.. {
@@ -148,6 +156,31 @@ pub fn search_each(shelves: &[Shelf], query: &str, k: usize, mode: Mode, embedde
         }
     }
     Ok(out)
+}
+
+/// `found` with the end of the chunk before and the start of the chunk after each one (from the same part, and not
+/// when that neighbour was found itself - it is handed over whole).
+pub fn with_neighbours(shelves: &[Shelf], found: &[Found], chars: usize) -> Vec<Found> {
+    let is_found = |s: usize, c: usize| found.iter().any(|f| f.shelf == s && f.chunk == c);
+    found
+        .iter()
+        .map(|f| {
+            let chunks = &shelves[f.shelf].index.chunks;
+            let me = &chunks[f.chunk];
+            let near = |c: Option<usize>| c.and_then(|c| chunks.get(c)).filter(|n| n.part == me.part && !is_found(f.shelf, n.id));
+            let mut text = String::new();
+            if let Some(prev) = near(f.chunk.checked_sub(1)) {
+                let tail: String = prev.text.chars().rev().take(chars).collect::<Vec<_>>().into_iter().rev().collect();
+                text.push_str(&format!("…{}\n\n", tail.trim_start()));
+            }
+            text.push_str(&f.text);
+            if let Some(next) = near(Some(f.chunk + 1)) {
+                let head: String = next.text.chars().take(chars).collect();
+                text.push_str(&format!("\n\n{}…", head.trim_end()));
+            }
+            Found { text, ..f.clone() }
+        })
+        .collect()
 }
 
 fn chunk_passages(corpus: &dyn Corpus, found: &[Found]) -> Vec<Passage> {
@@ -171,7 +204,7 @@ pub fn read(mode: Mode, src: Sources, query: &str, opts: ReadOptions, on_stage: 
         Mode::Rag | Mode::RagExpanded => {
             on_stage(if indexes.len() > 1 { "Searching each book's index" } else { "Searching the book's index" });
             let found = search_each(&indexes, query, RAG_CHUNKS, mode, embedder, opts.only)?;
-            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &found), ..Default::default() };
+            let mut out = Reading { retrieved: found.len(), passages: chunk_passages(corpus, &with_neighbours(&indexes, &found, NEIGHBOUR_CHARS)), ..Default::default() };
             out.ms = started.elapsed().as_secs_f64() * 1000.0;
             Ok(out)
         }
@@ -198,7 +231,9 @@ pub fn read(mode: Mode, src: Sources, query: &str, opts: ReadOptions, on_stage: 
             out.processed_tokens = read.processed_tokens;
             out.read_closely = read.read_closely;
             out.truncated = read.truncated;
-            out.passages.extend(read.passages);
+            // Labelled as what they are: a model's reading, which can blur a number or join two things that are
+            // apart in the book - where it differs from a quoted passage, the passage is right.
+            out.passages.extend(read.passages.into_iter().map(|p| Passage { text: format!("(Notes from reading the whole part - a reading, not the book's words; where they differ from a passage above, the passage is right.)\n{}", p.text), ..p }));
             out.ms = started.elapsed().as_secs_f64() * 1000.0;
             Ok(out)
         }
@@ -233,5 +268,23 @@ mod tests {
         assert_eq!(only_b.iter().map(|f| f.part).collect::<Vec<_>>(), vec![2], "a restriction to one book's parts is respected");
         let two = search_each(&shelves, "duty dragon bow", 2, Mode::Rag, None, None).unwrap();
         assert_eq!(two.len(), 2, "at most k in all");
+    }
+
+    /// A found chunk comes with the end of the one before and the start of the one after - from its own part only,
+    /// and not when that neighbour was found too.
+    #[test]
+    fn a_found_chunk_brings_the_edges_of_its_neighbours() {
+        let long = (0..6).map(|i| format!("Paragraph {i} begins. {} Paragraph {i} ends.", "Words of the book go on. ".repeat(60))).collect::<Vec<_>>().join("\n\n");
+        let ix = Index::plain(&[long.as_str(), "Another part."]);
+        let shelves = [Shelf { index: &ix, first_part: 0 }];
+        let last_of_part = ix.chunks.iter().filter(|c| c.part == 0).map(|c| c.id).max().unwrap();
+        assert!(last_of_part >= 2);
+        let found = |c: usize| Found { part: ix.chunks[c].part, text: ix.chunks[c].text.clone(), shelf: 0, chunk: c };
+        let got = with_neighbours(&shelves, &[found(1)], 40);
+        assert!(got[0].text.starts_with('…') && got[0].text.ends_with('…') && got[0].text.contains(&ix.chunks[1].text));
+        let both = with_neighbours(&shelves, &[found(1), found(2)], 40);
+        assert!(!both[0].text.ends_with('…') && both[1].text.starts_with(&ix.chunks[2].text[..20]), "a neighbour found itself is not repeated");
+        let edge = with_neighbours(&shelves, &[found(last_of_part)], 40);
+        assert!(!edge[0].text.ends_with('…'), "nothing from the next part");
     }
 }
