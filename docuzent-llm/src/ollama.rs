@@ -187,6 +187,12 @@ impl Llm for OllamaServer {
             }
             let v: Value = serde_json::from_str(&line).with_context(|| format!("Ollama sent something that is not JSON: {}", line.chars().take(200).collect::<String>()))?;
             if let Some(err) = v.get("error") {
+                // A model caught repeating itself is stopped by Ollama: what it wrote so far stands, cut off like a
+                // reply that reached its token limit - one reply lost, not the whole job.
+                if err.to_string().contains("repeat limit") {
+                    out.truncated = true;
+                    break;
+                }
                 bail!("Ollama reported an error: {err}");
             }
             // Reasoning is passed on - wrapped the way Qwen writes it - only when it was asked for; a model that
@@ -322,6 +328,22 @@ mod tests {
                 .into(),
             _ => "{}".into(),
         }
+    }
+
+    /// What qwen3:0.6b drew from Ollama mid-reply: stopped for repeating itself. The reply so far stands, marked cut
+    /// off; any other error is still an error.
+    #[test]
+    fn a_reply_stopped_for_repeating_itself_is_kept_as_cut_off_not_an_error() {
+        let (base, _) = serve(|key, _| match key {
+            "POST /api/chat" => [r#"{"message":{"role":"assistant","content":"[{\"n\": 1, \"context\": \"a a a"},"done":false}"#, r#"{"error":"prediction aborted, token repeat limit reached"}"#].join("\n"),
+            other => standard(other, ""),
+        });
+        let o = OllamaServer::connect(&base, "qwen3:14b", 12288).unwrap();
+        let c = o.complete(&chatml::ask("", "Describe it."), &Sampling::precise(200), &mut |_| {}).unwrap();
+        assert_eq!((c.text.as_str(), c.truncated), ("[{\"n\": 1, \"context\": \"a a a", true));
+        let (base, _) = serve(|key, _| if key == "POST /api/chat" { r#"{"error":"model runner has unexpectedly stopped"}"#.into() } else { standard(key, "") });
+        let o = OllamaServer::connect(&base, "qwen3:14b", 12288).unwrap();
+        assert!(o.complete(&chatml::ask("", "x"), &Sampling::precise(5), &mut |_| {}).is_err());
     }
 
     #[test]
