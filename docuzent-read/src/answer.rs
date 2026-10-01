@@ -77,7 +77,7 @@ pub fn answer_prompt_leash(question: &str, passages: &[Passage], offleash: bool)
     }
     let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, ANSWER_PASSAGES_CHARS) };
     format!(
-        "Passages from the document:\n{evidence}\n\nQuestion: {question}\n\nAnswer exactly what was asked, plainly and specifically: the names, numbers, order and events the passages give. Work out any counting, adding or comparing step by step before you state it. Use only these passages. If they do not say something, say in a sentence that the document does not say it, and stop: never guess, fill in, or bring in what you know from anywhere else. Answer in a few sentences."
+        "Passages from the document:\n{evidence}\n\nQuestion: {question}\n\nAnswer exactly what was asked, plainly and specifically: the names, numbers, order and events the passages give. Work out any counting, adding or comparing step by step before you state it. Use only these passages - and what the question itself gives: figures or facts it states may be worked through with what the passages say (a rule, a law, a formula, a method), showing the working. If they do not say something, say in a sentence that the document does not say it, and stop: never guess, fill in, or bring in what you know from anywhere else. Answer in a few sentences."
     )
 }
 
@@ -112,6 +112,7 @@ mod tests {
     fn the_answer_is_asked_for_plainly_from_the_passages_alone() {
         let p = answer_prompt("How old is Flamel?", &[Passage { part: 3, book: String::new(), text: "He is six hundred and sixty-five.".into() }]);
         assert!(p.contains("[part 3]") && p.contains("six hundred and sixty-five") && p.contains("does not say it") && p.contains("never guess"));
+        assert!(p.contains("what the question itself gives"), "a numerical's own figures may be worked through with the passages' formula");
         assert!(answer_prompt("x", &[]).contains("No passage"));
     }
 
