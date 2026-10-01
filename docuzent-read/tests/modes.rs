@@ -204,3 +204,36 @@ fn a_batch_cut_off_mid_way_is_described_again_passage_by_passage_and_a_second_pa
     assert_eq!(calls, 1, "one call, for the one chunk that was missing");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A model that never manages to describe one passage (here: any prompt holding it). The passage is tried on its
+/// own, recorded as undescribable, and not tried again on the next load - it is still found by its own text.
+fn stubborn_responder(prompt: &str) -> String {
+    if prompt.contains("Below are passages from this part of the book") {
+        if prompt.contains("THE STUBBORN ONE") {
+            return "I cannot describe this.".into();
+        }
+        let n = prompt.matches("\n[").count().max(1);
+        let items: Vec<String> = (1..=n).map(|i| format!(r#"{{"n": {i}, "context": "", "people": "", "setting": "described", "facts": [], "questions": []}}"#)).collect();
+        return format!("[{}]", items.join(","));
+    }
+    String::new()
+}
+
+#[test]
+fn a_passage_the_model_cannot_describe_is_recorded_once_and_not_retried_on_every_load() {
+    let dir = std::env::temp_dir().join(format!("docuzent-modes-stubborn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = Arc::new(SimEngine::new(12288, stubborn_responder).in_dir(&dir));
+    let pool = KvPool::new(engine.clone(), Arc::new(KvStore::open(&dir, 1 << 30).unwrap()));
+    let parts = ["A plain first part about a garden.", "THE STUBBORN ONE: a passage the model will not describe.", "A plain third part about a river."];
+    let corpus = MemCorpus { title: "The Book".into(), owner: "book".into(), parts: parts.iter().enumerate().map(|(i, t)| (format!("m-stub-p{i}.kv"), chatml::system(&format!("Part {}.\n\n{t}", i + 1)), t.to_string())).collect(), gist: String::new() };
+    let mut index = Index::plain(&parts);
+    assert_eq!(expand(&pool, &corpus, &mut index, "sim-model", &mut |_, _| {}).unwrap(), 1);
+    assert_eq!((index.undescribable.clone(), index.unexpanded()), (vec![1], Vec::<usize>::new()));
+    engine.clear_events();
+    assert_eq!(expand(&pool, &corpus, &mut index, "sim-model", &mut |_, _| {}).unwrap(), 0, "nothing left to try");
+    assert_eq!(engine.events().iter().filter(|e| matches!(e, docuzent_llm::sim::Event::Complete { .. })).count(), 0, "no call for it again");
+    let fresh = expand(&pool, &corpus, &mut index, "another-model", &mut |_, _| {}).unwrap();
+    assert_eq!((fresh, index.undescribable.clone()), (1, vec![1]), "a new model starts afresh (and fails afresh)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

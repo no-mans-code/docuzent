@@ -94,6 +94,10 @@ pub struct Index {
     pub made_by: Option<String>,
     /// The embedding model of `vectors`; `None` when there are none (words only).
     pub embed_model: Option<String>,
+    /// Chunks `made_by` could not describe even one at a time: found by their own text only, and not tried again
+    /// on every load (a new model's expansions start afresh).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undescribable: Vec<usize>,
     /// One vector per entry, when there is an embedder.
     #[serde(skip)]
     pub vectors: Vec<Vec<f32>>,
@@ -177,7 +181,7 @@ impl Index {
             }
         }
         let entries = chunks.iter().map(|c| Entry { chunk: c.id, kind: EntryKind::Text, text: c.text.clone() }).collect();
-        Self { version: INDEX_VERSION, chunking, chunks, entries, made_by: None, embed_model: None, vectors: Vec::new(), bm25: OnceLock::new() }
+        Self { version: INDEX_VERSION, chunking, chunks, entries, made_by: None, embed_model: None, undescribable: Vec::new(), vectors: Vec::new(), bm25: OnceLock::new() }
     }
 
     /// Plain chunks of every part.
@@ -193,7 +197,7 @@ impl Index {
     /// The chunks no expansion describes (in an index with expansions: the ones whose description failed).
     pub fn unexpanded(&self) -> Vec<usize> {
         let described: std::collections::HashSet<usize> = self.entries.iter().filter(|e| e.kind.is_expansion()).map(|e| e.chunk).collect();
-        (0..self.chunks.len()).filter(|c| !described.contains(c)).collect()
+        (0..self.chunks.len()).filter(|c| !described.contains(c) && !self.undescribable.contains(c)).collect()
     }
 
     pub fn add_expansions(&mut self, entries: Vec<Entry>, model: &str) {
