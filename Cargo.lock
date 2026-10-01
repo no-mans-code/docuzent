@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "kvcache"
 version = "0.1.0"
-source = "git+https://github.com/no-mans-code/kvcache#37e879cfc62872441bee636ae8e169624164cfa9"
+source = "git+https://github.com/no-mans-code/kvcache#b95e0c3a18eca73b66785bdc029866d03aecb413"
 dependencies = [
  "anyhow",
  "fs4",
@@ -1137,7 +1137,7 @@ dependencies = [
 [[package]]
 name = "ollama-kv-profiler"
 version = "0.1.0"
-source = "git+https://github.com/no-mans-code/ollama-kv-profiler#842192e51466e2de81d4d3e14b5ce979006f3440"
+source = "git+https://github.com/no-mans-code/ollama-kv-profiler#170070035e7783ea6ee78f35d0e07708ce6662d9"
 dependencies = [
  "anyhow",
  "clap",
