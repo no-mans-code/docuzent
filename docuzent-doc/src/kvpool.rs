@@ -76,10 +76,10 @@ impl KvPool {
     /// `file`, and registers it (owned by `owner`) with the LRU store.
     pub fn prime(&self, file: &str, owner: &str, prefix: &str) -> Result<Primed> {
         let _slot = self.slot.lock().unwrap();
-        self.prime_locked(file, owner, prefix)
+        self.prime_locked(file, owner, prefix, false)
     }
 
-    fn prime_locked(&self, file: &str, owner: &str, prefix: &str) -> Result<Primed> {
+    fn prime_locked(&self, file: &str, owner: &str, prefix: &str, scanning: bool) -> Result<Primed> {
         let engine = self.engine();
         if !engine.persists() {
             // Nothing can be saved: reading the prefix now would only be thrown away.
@@ -92,7 +92,7 @@ impl KvPool {
         let c = engine.complete(prefix, &Sampling::precise(1), &mut |_| {})?;
         let prefill_ms = if c.prompt_ms > 0.0 { c.prompt_ms } else { t0.elapsed().as_secs_f64() * 1000.0 };
         let io = engine.save(file)?;
-        let evicted = self.store.register(file, owner)?;
+        let evicted = if scanning { self.store.register_keeping(file, owner)? } else { self.store.register(file, owner)? };
         *self.resident.lock().unwrap() = Some(file.to_string());
         Ok(Primed { tokens: c.prompt_tokens + c.cached_tokens, prefill_ms, save_ms: io.ms, bytes: io.bytes, evicted })
     }
@@ -101,6 +101,18 @@ impl KvPool {
     /// the file is gone) and runs `f` with the model. Returns `f`'s result
     /// and how the state got there.
     pub fn with_resident<R>(&self, file: &str, owner: &str, prefix: &str, f: impl FnOnce(&dyn Llm) -> Result<R>) -> Result<(R, Swap)> {
+        self.resident_then(file, owner, prefix, false, f)
+    }
+
+    /// [`KvPool::with_resident`] for one step of a scan - every part of a document read in turn, scan after scan. A
+    /// part read again is saved only if that evicts no other part of the same document (see
+    /// [`KvStore::register_keeping`]): on a document larger than the store, plain LRU would evict each part just
+    /// before the next scan wants it, so that no scan ever restores one.
+    pub fn with_resident_scan<R>(&self, file: &str, owner: &str, prefix: &str, f: impl FnOnce(&dyn Llm) -> Result<R>) -> Result<(R, Swap)> {
+        self.resident_then(file, owner, prefix, true, f)
+    }
+
+    fn resident_then<R>(&self, file: &str, owner: &str, prefix: &str, scanning: bool, f: impl FnOnce(&dyn Llm) -> Result<R>) -> Result<(R, Swap)> {
         let _slot = self.slot.lock().unwrap();
         let engine = self.engine();
         if !engine.persists() {
@@ -121,7 +133,7 @@ impl KvPool {
                 None => {
                     // Evicted, or written by other weights: read the text again.
                     let _ = self.store.remove(file);
-                    let p = self.prime_locked(file, owner, prefix)?;
+                    let p = self.prime_locked(file, owner, prefix, scanning)?;
                     Swap::Reprimed { tokens: p.tokens, prefill_ms: p.prefill_ms }
                 }
             }

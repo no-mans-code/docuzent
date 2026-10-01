@@ -231,7 +231,8 @@ fn score_parts(pool: &KvPool, corpus: &dyn Corpus, query: &str, on_stage: &dyn F
         }
         on_stage(&format!("Reading part {} of {}", i + 1, total));
         let prefix = corpus.part_prefix(i);
-        let (c, swap) = pool.with_resident(corpus.part_file(i), corpus.part_owner(i), &prefix, |llm| llm.complete(&chatml::ask(&prefix, &score_prompt(query)), &Sampling::precise(SCORE_TOKENS), &mut |_| {}))?;
+        // a scan: on a document larger than the store, keep a stable set of saved parts rather than churn them all
+        let (c, swap) = pool.with_resident_scan(corpus.part_file(i), corpus.part_owner(i), &prefix, |llm| llm.complete(&chatml::ask(&prefix, &score_prompt(query)), &Sampling::precise(SCORE_TOKENS), &mut |_| {}))?;
         out.processed_tokens += c.prompt_tokens;
         let again = count_swap(out, &swap);
         // A reply that is not a digit is no evidence the part is irrelevant: read it closely.

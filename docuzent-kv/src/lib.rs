@@ -147,6 +147,19 @@ impl KvStore {
     /// registration; other books' files go first, and only if that is not
     /// enough do older files of the same book.
     pub fn register(&self, name: &str, owner: &str) -> Result<Vec<String>> {
+        self.register_with(name, owner, false)
+    }
+
+    /// [`KvStore::register`] for a file written during a scan of `owner`'s files (each read in turn, again and again):
+    /// if making room would evict one of `owner`'s own files, the new file is dropped instead (and is the one name
+    /// returned). Plain LRU on a scan longer than the store evicts each file just before the next scan wants it - not
+    /// one hit; keeping what is stored and turning the newcomer away keeps a stable set that every scan reuses.
+    /// Other owners' files are evicted first, as ever.
+    pub fn register_keeping(&self, name: &str, owner: &str) -> Result<Vec<String>> {
+        self.register_with(name, owner, true)
+    }
+
+    fn register_with(&self, name: &str, owner: &str, keep_own: bool) -> Result<Vec<String>> {
         if !valid_name(name) {
             bail!("`{name}` is not a valid KV file name");
         }
@@ -175,6 +188,13 @@ impl KvStore {
                 .min_by_key(|(_, e)| (e.owner == owner && !over_share, e.last_used))
                 .map(|(n, _)| n.clone());
             let Some(victim) = victim else { break };
+            if keep_own && idx.entries.get(&victim).is_some_and(|e| e.owner == owner) {
+                // turn the newcomer away rather than evict what the scan will want again
+                let _ = std::fs::remove_file(self.dir.join(name));
+                idx.entries.remove(name);
+                evicted.push(name.to_string());
+                break;
+            }
             let _ = std::fs::remove_file(self.dir.join(&victim));
             idx.entries.remove(&victim);
             evicted.push(victim);
@@ -282,6 +302,55 @@ mod tests {
         assert_eq!(evicted, vec!["b.kv"], "b was the least recently used");
         assert!(s.contains("a.kv") && s.contains("c.kv") && !s.contains("b.kv"));
         assert!(!d.join("b.kv").exists(), "eviction really deletes the file");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Five parts, room for three, read in order again and again (a scan). Plain LRU evicts each part just before
+    /// the next scan wants it - not one hit; turning the newcomer away keeps three that every scan finds.
+    #[test]
+    fn a_scan_longer_than_the_store_keeps_a_stable_set_instead_of_evicting_what_it_wants_next() {
+        let scan = |keeping: bool| -> usize {
+            let d = temp_dir(if keeping { "scan-keep" } else { "scan-lru" });
+            let s = KvStore::open(&d, 300).unwrap();
+            let mut hits = 0;
+            for _round in 0..3 {
+                for p in 1..=5 {
+                    let n = format!("p{p}.kv");
+                    if s.contains(&n) {
+                        hits += 1;
+                        s.touch(&n).unwrap();
+                    } else {
+                        write(&s, &n, 100);
+                        let evicted = if keeping { s.register_keeping(&n, "book") } else { s.register(&n, "book") }.unwrap();
+                        assert!(!keeping || evicted.is_empty() || evicted == vec![n.clone()], "{evicted:?}");
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(d);
+            hits
+        };
+        assert_eq!(scan(false), 0, "LRU: every part was evicted just before it was wanted");
+        assert_eq!(scan(true), 6, "keeping: the first three parts hit in each later scan");
+    }
+
+    /// Over the whole budget, a scan's newcomer still makes room by evicting other books' files first; over its own
+    /// share (half the store, while other books are in it) it is turned away rather than evict its own parts.
+    #[test]
+    fn a_scan_evicts_other_books_first_and_keeps_to_its_share() {
+        let d = temp_dir("scan-others");
+        // 500 in all; a book's share, while another is in the store, is 250
+        let s = KvStore::open(&d, 500).unwrap();
+        for n in ["old1.kv", "old2.kv"] {
+            write(&s, n, 200);
+            s.register(n, "old-book").unwrap();
+        }
+        write(&s, "p1.kv", 120);
+        assert_eq!(s.register_keeping("p1.kv", "book").unwrap(), vec!["old1.kv"], "over the store: another book's oldest made room");
+        write(&s, "p2.kv", 120);
+        assert_eq!(s.register_keeping("p2.kv", "book").unwrap(), Vec::<String>::new(), "within its share, and the store");
+        write(&s, "p3.kv", 120);
+        assert_eq!(s.register_keeping("p3.kv", "book").unwrap(), vec!["p3.kv"], "over its share: the newcomer is turned away");
+        assert!(s.contains("p1.kv") && s.contains("p2.kv") && s.contains("old2.kv") && !d.join("p3.kv").exists());
         let _ = std::fs::remove_dir_all(d);
     }
 
