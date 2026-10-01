@@ -96,6 +96,20 @@ struct Question {
     any_of: Vec<String>,
     #[serde(default)]
     never: Vec<String>,
+    /// What a right answer looks like *off the leash* (the model may reason and use knowledge beyond the book), when
+    /// that differs - for a question the book cannot answer, "the book does not say" is right on the leash, wrong off it.
+    #[serde(default)]
+    offleash: Option<Check>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct Check {
+    #[serde(default)]
+    must: Vec<String>,
+    #[serde(default)]
+    any_of: Vec<String>,
+    #[serde(default)]
+    never: Vec<String>,
 }
 
 fn default_set() -> String {
@@ -174,8 +188,10 @@ fn secs(t: Instant) -> f64 {
     t.elapsed().as_secs_f64()
 }
 
-fn check(q: &Question, answer: &str) -> Vec<String> {
+fn check(q: &Question, answer: &str, offleash: bool) -> Vec<String> {
     let re = |p: &str| RegexBuilder::new(p).case_insensitive(true).build();
+    let own = Check { must: q.must.clone(), any_of: q.any_of.clone(), never: q.never.clone() };
+    let q = if offleash { q.offleash.as_ref().unwrap_or(&own) } else { &own };
     let mut problems = Vec::new();
     for p in &q.must {
         if !re(p).map(|r| r.is_match(answer)).unwrap_or(false) {
@@ -232,8 +248,8 @@ fn main() -> Result<()> {
     let mut learned: Learned = std::fs::read(&learned_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let save_learned = |l: &Learned| std::fs::write(&learned_path, serde_json::to_vec_pretty(l).unwrap());
 
-    // mode[:guided][:expanded] - rag-expanded is always expanded; rag-kv:expanded searches an expanded index
-    let runs: Vec<(Mode, Chunking, bool, String)> = cli
+    // mode[:guided][:expanded][:offleash]
+    let runs: Vec<(Mode, Chunking, bool, bool, String)> = cli
         .runs
         .split(',')
         .map(|r| {
@@ -242,19 +258,23 @@ fn main() -> Result<()> {
             let rest: Vec<&str> = tokens.collect();
             let chunking = if rest.contains(&"guided") { Chunking::Guided } else { Chunking::Plain };
             let expanded = mode.needs_expansions() || rest.contains(&"expanded");
+            let offleash = rest.contains(&"offleash");
             let mut name = mode.as_str().to_string();
             if chunking == Chunking::Guided {
                 name.push_str(" (guided chunks)");
             }
-            if expanded && mode != Mode::RagExpanded {
+            if expanded && !mode.needs_expansions() {
                 name.push_str(" (expanded index)");
             }
-            Ok((mode, chunking, expanded, name))
+            if offleash {
+                name.push_str(" (off-leash)");
+            }
+            Ok((mode, chunking, expanded, offleash, name))
         })
         .collect::<Result<_>>()?;
 
     // saved parts: every run that needs them, and guided chunking and expansions (which read each part resident)
-    let need_kv = runs.iter().any(|(m, c, x, _)| m.needs_saved_parts() || *x || *c == Chunking::Guided);
+    let need_kv = runs.iter().any(|(m, c, x, _, _)| m.needs_saved_parts() || *x || *c == Chunking::Guided);
     if need_kv {
         let missing: Vec<usize> = (0..corpus.part_count()).filter(|i| !store.contains(corpus.part_file(*i))).collect();
         if !missing.is_empty() {
@@ -307,7 +327,7 @@ fn main() -> Result<()> {
 
     let mut results: Vec<QuestionResult> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::new();
-    for (mode, chunking, expanded, name) in &runs {
+    for (mode, chunking, expanded, offleash, name) in &runs {
         let index = if mode.needs_index() { Some(index_for(*chunking, *expanded, &mut learned)?) } else { None };
         save_learned(&learned)?;
         // what learning the book takes for this run: chunking (guided needs the model; plain is instant), expansions,
@@ -326,10 +346,10 @@ fn main() -> Result<()> {
             let reading = read(*mode, Sources { pool: &pool, corpus: &corpus, indexes: index.as_ref().map(|i| vec![docuzent_read::Shelf { index: i, first_part: 0 }]).unwrap_or_default(), embedder: embedder.as_deref() }, &q.q, ReadOptions::default(), &|_| {})?;
             let read_s = secs(t);
             let ta = Instant::now();
-            let ans = pool.with_scratch(|llm| answer::answer(llm, &q.q, &reading.passages))?;
+            let ans = pool.with_scratch(|llm| answer::answer_leash(llm, &q.q, &reading.passages, *offleash))?;
             let answer_s = secs(ta);
             let seconds = secs(t);
-            let problems = check(q, &ans);
+            let problems = check(q, &ans, *offleash);
             let pass = problems.is_empty();
             total += 1;
             passed += pass as usize;

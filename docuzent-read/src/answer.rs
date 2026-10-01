@@ -17,7 +17,19 @@ pub const ANSWER_PASSAGES_CHARS: usize = 26_000;
 const ANSWER_TOKENS: i32 = 600;
 const THINK_TOKENS: i32 = 1800;
 
+/// Off the leash: the document first, then reasoning and knowledge from beyond it - always said to be so.
+pub const OFFLEASH_RULE: &str = "The person has taken you OFF THE LEASH for this answer: the rule to use only the document is lifted. Start from what the passages say and build on it: reason step by step, work numbers through, and use what you know from beyond the document where it is not enough. Say plainly which parts come from the document and which are your own reasoning or knowledge (\"the document says...\", \"beyond the document...\"). If the document is a story and what you know goes further into it than the passages do, say so before you say it.";
+
 pub fn answer_prompt(question: &str, passages: &[Passage]) -> String {
+    answer_prompt_leash(question, passages, false)
+}
+
+/// The answer prompt, on the leash (only the passages) or off it ([`OFFLEASH_RULE`]).
+pub fn answer_prompt_leash(question: &str, passages: &[Passage], offleash: bool) -> String {
+    if offleash {
+        let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, ANSWER_PASSAGES_CHARS) };
+        return format!("Passages from the document:\n{evidence}\n\nQuestion: {question}\n\n{OFFLEASH_RULE} Answer in a few sentences, showing the working.");
+    }
     let evidence = if passages.is_empty() { "(No passage of the document speaks to this.)".to_string() } else { passages_block(passages, ANSWER_PASSAGES_CHARS) };
     format!(
         "Passages from the document:\n{evidence}\n\nQuestion: {question}\n\nAnswer exactly what was asked, plainly and specifically: the names, numbers, order and events the passages give. Work out any counting, adding or comparing step by step before you state it. Use only these passages. If they do not say something, say in a sentence that the document does not say it, and stop: never guess, fill in, or bring in what you know from anywhere else. Answer in a few sentences."
@@ -26,8 +38,13 @@ pub fn answer_prompt(question: &str, passages: &[Passage]) -> String {
 
 /// The answer, reasoned through first when the question counts or compares and the model can reason.
 pub fn answer(llm: &dyn Llm, question: &str, passages: &[Passage]) -> Result<String> {
-    let prompt = answer_prompt(question, passages);
-    if needs_thinking(question) && llm.can_think() {
+    answer_leash(llm, question, passages, false)
+}
+
+/// [`answer`], on the leash or off it (off the leash, every answer is reasoned through first).
+pub fn answer_leash(llm: &dyn Llm, question: &str, passages: &[Passage], offleash: bool) -> Result<String> {
+    let prompt = answer_prompt_leash(question, passages, offleash);
+    if (needs_thinking(question) || offleash) && llm.can_think() {
         let c = llm.complete(&format!("{}{}", chatml::user(&prompt), chatml::assistant_open_thinking()), &Sampling::thinking(ANSWER_TOKENS + THINK_TOKENS), &mut |_| {})?;
         if let Some(i) = c.text.find("</think>") {
             return Ok(c.text[i + "</think>".len()..].trim().to_string());
