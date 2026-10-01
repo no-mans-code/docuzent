@@ -56,6 +56,32 @@ Requires a running local Ollama (`ollama serve`) with the chosen model pulled, a
 | **Model agnostic** | Connects to any local LLM via the Ollama API. Selectable at runtime from the browser UI, not just at startup. |
 | **Benchmarked, not claimed** | `docuzent bench` measures the cache's real effect on your own machine and model - see "Measured Performance" below. |
 | **Atomiser** | Separate, reusable crate (`no-mans-code/atomiser`) for query/task decomposition - not yet wired in here, built for the multi-document RAG mode once it resumes. Tracked for possible transparent use in simple mode too - see open issues. |
+| **Long documents, four ways** | `docuzent read` asks a book-length document a question by RAG, expanded RAG, RAG pointing at saved KV parts, or saved KV parts only - with real KV-state save/restore through llama.cpp. Every step is sized to the model's window (1,024 tokens up to a hard 32,768, lowerable with `DOCUZENT_MAX_CONTEXT`), and no passage is ever cut off unread - more than one call holds is swept. Measured on four books with a 14B model and with 3B, 1B and 0.6B models: [docs/READING_MODES.md](docs/READING_MODES.md). |
+
+---
+
+## The engine: long documents, and the tools built on it
+
+docuzent is also the engine other tools are built on - [thebook](https://github.com/no-mans-code) (talk to a book, and
+its characters) reads every book through it. Improving these crates improves every tool that uses them:
+
+| crate | is |
+|---|---|
+| `docuzent-llm` | model engines: **llama.cpp with real KV-cache save/restore** (a part is restored in ~0.1 s instead of re-read in ~2 s), Ollama (any model, its own chat template), a simulated engine for tests; embeddings (OpenAI-compatible `/v1/embeddings`, Ollama, simulated) |
+| `docuzent-kv` | the size-bounded, least-recently-used store of saved KV files; *scoped* stores share a directory without ever touching each other's files |
+| `docuzent-doc` | extraction (txt/md/epub/html natively, PDF via poppler, the rest via Docling), a clean title and author read from a document's first pages, parts that fit one context, the pool that swaps each part's saved state in and out |
+| `docuzent-read` | the four reading modes behind one call, the hybrid (BM25 + vector) index, expansions, a plain answerer |
+| `docuzent-eval` | measures the modes on real books: accuracy, seconds per question, learning time, disk |
+| `docuzent-core` | the Ollama single-document Q&A below (its chunking, hashing, ingestion and embeddings now come from the crates above, under their old paths) |
+
+```bash
+# a llama.cpp server that saves KV states into ./.docuzent-kv:
+llama-server -m qwen3-14b-q4_k_m.gguf -c 12288 -np 1 --slot-save-path ./.docuzent-kv
+# ask a book, in the mode of your choice (rag, rag-expanded, rag-kv, kv):
+docuzent read book.pdf "Who replaced Pete Best in the Beatles?" --mode rag-kv --embed-url http://localhost:11434
+# measure the modes on a book with a checked question set:
+eval/run.sh ~/books/gita.txt gita
+```
 
 ---
 
